@@ -1,54 +1,93 @@
-{# v1.2 - Ajustado para compatibilidade com rota FastAPI e modelo 'Contrato' #}
-{# v1.1 - Estilo com tabela Bootstrap responsiva #}
-{# v1.0 - Listagem de contratos em tabela HTML #}
-
 {% extends "base.html" %}
 
 {% block title %}Lista de Contratos{% endblock %}
 
 {% block content %}
+<div class="d-flex justify-content-end align-items-center mb-3">
+  <form action="/contratos/sincronizar" method="post"
+        onsubmit="return confirm('Atualizar todos os contratos? Esta operação pode levar alguns segundos.');">
+    <button type="submit" class="btn btn-primary">Atualizar tudo</button>
+  </form>
+</div>
+
+{% if request.query_params.get('ok') == '1' %}
+  <div class="alert alert-success alert-dismissible fade show" role="alert">
+    Atualização em lote concluída — atualizados: {{ request.query_params.get('n','0') }},
+    sem cabeçalho: {{ request.query_params.get('skip','0') }}, erros: {{ request.query_params.get('err','0') }}.
+    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+  </div>
+{% endif %}
+
+<div class="d-flex justify-content-end align-items-center mb-3">
+  <!-- Botão global opcional: para um endpoint de sincronização em lote (se você criar) -->
+  <!-- <form action="/contratos/sincronizar" method="post">
+    <button type="submit" class="btn btn-primary">Atualizar TODOS os itens</button>
+  </form> -->
+</div>
+
+{% if request.query_params.get('ok') == '1' %}
+  <div class="alert alert-success alert-dismissible fade show" role="alert">
+    Itens atualizados com sucesso! ({{ request.query_params.get('n', '0') }} item(ns))
+    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+  </div>
+{% elif request.query_params.get('msg') == 'sem_itens' %}
+  <div class="alert alert-warning alert-dismissible fade show" role="alert">
+    Nenhum item encontrado para este contrato.
+    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+  </div>
+{% endif %}
+
 <h2>📄 Lista de Contratos</h2>
 
 <div class="table-responsive mt-3">
-    <table class="table table-bordered table-striped table-hover table-sm">
-        <thead class="table-dark">
-            <tr>
-                <th>ID</th>
-                <th>Ativo</th>
-                <th>Serial</th>
-                <th>Código Produto</th>
-                <th>Descrição</th>
-                <th>Cód. Cliente</th>
-                <th>Nome Cliente</th>
-                <th>Data Envio</th>
-                <th>Contrato Nº</th>
-                <th>Valor Mensal</th>
-                <th>Período Contratual</th>
-                <th>Meses Restantes</th>
-                <th>Valor Global</th>
-                <th>Valor Presente</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for c in contratos %}
-            <tr>
-                <td>{{ c.id }}</td>
-                <td>{{ c.ativo }}</td>
-                <td>{{ c.serial }}</td>
-                <td>{{ c.cod_pro }}</td>
-                <td>{{ c.descricao_produto }}</td>
-                <td>{{ c.cod_cli }}</td>
-                <td>{{ c.nome_cli }}</td>
-                <td>{{ c.data_envio.strftime('%d/%m/%Y') if c.data_envio else '' }}</td>
-                <td>{{ c.contrato_n }}</td>
-                <td>R$ {{ "{:,.2f}".format(c.valor_mensal) }}</td>
-                <td>{{ c.periodo_contratual }}</td>
-                <td>{{ c.meses_restantes }}</td>
-                <td>R$ {{ "{:,.2f}".format(c.valor_global_contrato) }}</td>
-                <td>R$ {{ "{:,.2f}".format(c.valor_presente_contrato) }}</td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+  <table class="table table-bordered table-striped table-hover table-sm">
+    <thead class="table-dark">
+      <tr>
+        <th>ID</th>
+        <th>Ativo</th>
+        <th>Serial</th>
+        <th>Código Produto</th>
+        <th>Descrição</th>
+        <th>Cód. Cliente</th>
+        <th>Nome Cliente</th>
+        <th>Data Envio</th>
+        <th>Contrato Nº</th>
+        <th>Valor Mensal</th>
+        <th>Período Contratual</th>
+        <th>Meses Restantes</th>
+        <th>Valor Global</th>
+        <th>Valor Presente</th>
+        <th>Ações</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in contratos %}
+      <tr>
+        <td>{{ c.id }}</td>
+        <td>{{ c.ativo }}</td>
+        <td>{{ c.serial }}</td>
+        <td>{{ c.cod_pro }}</td>
+        <td>{{ c.descricao_produto }}</td>
+        <td>{{ c.cod_cli }}</td>
+        <td>{{ c.nome_cli }}</td>
+        <td>{{ c.data_envio.strftime('%d/%m/%Y') if c.data_envio else '' }}</td>
+        <td>{{ c.contrato_n }}</td>
+        <td>R$ {{ "{:,.2f}".format(c.valor_mensal) }}</td>
+        <td>{{ c.periodo_contratual }}</td>
+        <td>{{ c.meses_restantes }}</td>
+        <td>R$ {{ "{:,.2f}".format(c.valor_global_contrato) }}</td>
+        <td>R$ {{ "{:,.2f}".format(c.valor_presente_contrato) }}</td>
+        <td>
+          <form action="/contratos/sincronizar/{{ c.contrato_n }}" method="post" class="d-inline"
+                onsubmit="return confirm('Sincronizar período e recalcular os itens do contrato {{ c.contrato_n }}?');">
+            <button type="submit" class="btn btn-sm btn-outline-primary">
+              Atualizar
+            </button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
 </div>
 {% endblock %}

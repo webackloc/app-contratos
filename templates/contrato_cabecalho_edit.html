@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}Editar Contrato (Cabeçalho){% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h2>Editar Contrato (Cabeçalho)</h2>
+  <a href="{{ request.headers.get('referer') or '/contratos' }}" class="btn btn-outline-secondary">Voltar</a>
+</div>
+
+<div class="card shadow-sm">
+  <div class="card-body">
+    <form method="post" action="/contratos/cabecalhos/{{ cab.id }}/editar?next={{ request.query_params.get('next','') }}">
+      <div class="row g-3">
+        <div class="col-md-6">
+          <label class="form-label">Nome do Cliente</label>
+          <input type="text" name="nome_cliente" class="form-control" required
+                 value="{{ cab.nome_cliente or cab.nome_cli or '' }}">
+        </div>
+        <div class="col-md-6">
+          <label class="form-label">CNPJ</label>
+          <input type="text" name="cnpj" class="form-control" required
+                 value="{{ cab.cnpj or '' }}" placeholder="99.999.999/9999-99">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label">Contrato Num</label>
+          <input type="text" name="contrato_num" class="form-control"
+                 value="{{ cab.contrato_n or cab.contrato_num or cab.numero or cab.numero_contrato or '' }}">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label">Prazo Contratual (meses)</label>
+          <input type="number" name="prazo_contratual" class="form-control" min="0" required
+                 value="{{ cab.prazo_contratual if cab.prazo_contratual is not none else cab.periodo_contratual }}">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label">Índice de Reajuste (ano)</label>
+          <input type="text" name="indice_reajuste" class="form-control" placeholder="ex: 6% ou 0,06"
+                 value="{{ cab.indice_reajuste or '' }}">
+        </div>
+        <div class="col-md-6">
+          <label class="form-label">Vendedor</label>
+          <input type="text" name="vendedor" class="form-control"
+                 value="{{ cab.vendedor or '' }}">
+        </div>
+      </div>
+
+      <div class="mt-4 d-flex gap-2">
+        <button type="submit" class="btn btn-primary">Salvar alterações</button>
+        <a class="btn btn-light" href="{{ request.headers.get('referer') or '/contratos' }}">Cancelar</a>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+// máscara simples de CNPJ (só aparência; validação real deve ser no backend)
+document.addEventListener('input', function(e){
+  if (e.target.name === 'cnpj') {
+    let v = e.target.value.replace(/\D/g,'').slice(0,14);
+    let out = '';
+    if (v.length > 12) out = v.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2}).*/, "$1.$2.$3/$4-$5");
+    else if (v.length > 8) out = v.replace(/^(\d{2})(\d{3})(\d{3})(\d{0,4}).*/, "$1.$2.$3/$4");
+    else if (v.length > 5) out = v.replace(/^(\d{2})(\d{3})(\d{0,3}).*/, "$1.$2.$3");
+    else if (v.length > 2) out = v.replace(/^(\d{2})(\d{0,3}).*/, "$1.$2");
+    else out = v;
+    e.target.value = out;
+  }
+});
+</script>
+{% endblock %}
