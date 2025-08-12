@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from utils.auth_middleware import AuthRequiredMiddleware
 
-from routers import admin_users as admin_users_router
+from routers import admin_users as admin_users_router, contratos_sync, cabecalhos_edit
 
 
 # ── MODELOS ────────────────────────────────────────────────────────────────────
@@ -135,6 +135,8 @@ if dashboard and hasattr(dashboard, "router"):
     app.include_router(dashboard.router, prefix="/api")
 
 app.include_router(admin_users_router.router)
+app.include_router(contratos_sync.router, prefix="/contratos", tags=["contratos"])
+app.include_router(cabecalhos_edit.router, tags=["contratos"])
 
 # ── DB util ───────────────────────────────────────────────────────────────────
 def get_db():

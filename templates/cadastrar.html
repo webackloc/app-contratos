@@ -1,11 +1,10 @@
 {# =========================================================================
    templates/cadastrar.html
-   Versão: v1.3.2 - 2025-08-11
+   Versão: v1.3.3 - 2025-08-12
    CHANGELOG:
-     - [*] Mantém o campo do formulário como "contrato_num" (compatível com versões anteriores).
-     - [+] Backend agora aceita "contrato_num" OU "contrato_n".
-     - [+] Exibição de mensagens de erro (quando o backend retornar "erro" no contexto).
-     - [*] Tabela de contratos: fallback para mostrar contrato_n ou contrato_num.
+     - [+] Coluna "Ações" na tabela e botão "Editar" por linha.
+     - [*] Remove trechos soltos de <th>/<td> fora da tabela.
+     - [*] Mantém compatibilidade contrato_n/contrato_num.
    ========================================================================= #}
 {% extends "base.html" %}
 {% block title %}Cadastrar Contrato{% endblock %}
@@ -13,8 +12,15 @@
 {% block content %}
 <h2>📝 Cadastrar Novo Contrato</h2>
 
+{# Alertas de sucesso/erro #}
+{% if request.query_params.get('ok') == '1' and request.query_params.get('edit') == '1' %}
+  <div class="alert alert-success alert-dismissible fade show" role="alert">
+    Cabeçalho editado com sucesso.
+    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+  </div>
+{% endif %}
 {% if erro %}
-<div class="alert alert-danger">{{ erro }}</div>
+  <div class="alert alert-danger">{{ erro }}</div>
 {% endif %}
 
 <form method="post" action="/cadastrar" class="row g-3 mt-3">
@@ -69,28 +75,43 @@
 
 <hr class="mt-5 mb-4">
 <h4>📋 Contratos Cadastrados</h4>
-<table class="table table-striped">
-  <thead>
-    <tr>
-      <th>Cliente</th>
-      <th>CNPJ</th>
-      <th>Contrato Nº</th>
-      <th>Prazo</th>
-      <th>Índice</th>
-      <th>Vendedor</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for contrato in contratos %}
-    <tr>
-      <td>{{ contrato.nome_cliente }}</td>
-      <td>{{ contrato.cnpj }}</td>
-      <td>{{ contrato.contrato_n or contrato.contrato_num }}</td>
-      <td>{{ contrato.prazo_contratual }}</td>
-      <td>{{ contrato.indice_reajuste }}</td>
-      <td>{{ contrato.vendedor }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
+<div class="table-responsive">
+  <table class="table table-striped table-hover align-middle">
+    <thead class="table-dark">
+      <tr>
+        <th>Cliente</th>
+        <th>CNPJ</th>
+        <th>Contrato Nº</th>
+        <th>Prazo</th>
+        <th>Índice</th>
+        <th>Vendedor</th>
+        <th class="text-nowrap">Ações</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if contratos and contratos|length > 0 %}
+        {% for contrato in contratos %}
+          <tr>
+            <td>{{ contrato.nome_cliente or contrato.nome_cli }}</td>
+            <td>{{ contrato.cnpj }}</td>
+            <td>{{ contrato.contrato_n or contrato.contrato_num }}</td>
+            <td>{{ contrato.prazo_contratual if contrato.prazo_contratual is not none else contrato.periodo_contratual }}</td>
+            <td>{{ contrato.indice_reajuste }}</td>
+            <td>{{ contrato.vendedor }}</td>
+            <td class="text-nowrap">
+              <a class="btn btn-sm btn-outline-secondary"
+                 href="/contratos/cabecalhos/{{ contrato.id }}/editar?next={{ request.url.path }}">
+                 Editar
+              </a>
+            </td>
+          </tr>
+        {% endfor %}
+      {% else %}
+        <tr>
+          <td colspan="7" class="text-center text-muted">Nenhum cabeçalho cadastrado ainda.</td>
+        </tr>
+      {% endif %}
+    </tbody>
+  </table>
+</div>
 {% endblock %}

@@ -1,78 +1,69 @@
-"""
-Módulo: Database
-Versão: 1.2.0
-Data: 2025-08-11
-Autor: Leonardo Muller
+# database.py
+# -----------------------------------------------------------------------------
+# Criação do engine e sessão do SQLAlchemy com suporte a:
+# - DATABASE_URL via variável de ambiente (produção)
+# - Fallback para SQLite local (desenvolvimento)
+# - Normalização de "postgres://" -> "postgresql://"
+# - Pool conservador (NullPool) e pre_ping no Postgres (evita conexões mortas)
+# - EXPÕE Base = declarative_base() para uso pelos models
+# -----------------------------------------------------------------------------
 
-Descrição:
-    Configuração do banco de dados (SQLAlchemy) e sessão para uso com FastAPI.
-    Expõe:
-        - engine
-        - SessionLocal
-        - Base
-        - get_db(): dependência para injetar sessão nos endpoints
-
-Histórico de Alterações:
-    1.2.0 - 2025-08-11
-        • Adicionada a função get_db() para uso como dependência no FastAPI.
-        • Definido expire_on_commit=False para evitar objetos expirados após commit.
-        • Mantido SQLite local (contratos.db) com check_same_thread=False (Windows/uvicorn reload).
-    1.1.0 - 2025-08-06
-        • Ajustes de compatibilidade com SQLAlchemy e organização.
-    1.0.0 - 2025-08-06
-        • Criação do módulo inicial (engine, SessionLocal, Base).
-"""
-
-from __future__ import annotations
 import os
-from typing import Generator
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.pool import NullPool
 
-# URL de conexão (env > default). Mantém seu padrão anterior: ./contratos.db
-SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./contratos.db").strip()
-
-# Parâmetros específicos para SQLite (necessário no Windows/uvicorn com reload)
-connect_args = {"check_same_thread": False} if SQLALCHEMY_DATABASE_URL.startswith("sqlite") else {}
-
-# Engine
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL,
-    connect_args=connect_args,
-    future=True,
-    echo=False,  # mude para True se quiser logs SQL no console
-)
-
-# Session factory
-SessionLocal = sessionmaker(
-    bind=engine,
-    autocommit=False,
-    autoflush=False,
-    expire_on_commit=False,  # evita expirar objetos após commit (facilita no FastAPI)
-    future=True,
-)
-
-# Base ORM para seus modelos
+# Declarative Base para os modelos (ex.: from database import Base)
 Base = declarative_base()
 
-def get_db() -> Generator:
-    """
-    Dependência para injetar sessão nos endpoints FastAPI.
-    Uso:
-        from fastapi import Depends
-        from sqlalchemy.orm import Session
 
-        @app.get("/algo")
-        def handler(db: Session = Depends(get_db)):
-            ...
+def _normalize_db_url(url: str) -> str:
+    """Normaliza esquemas antigos do Postgres ('postgres://') para 'postgresql://'.
+    Não altera URLs vazias ou SQLite.
     """
+    if not url:
+        return url
+    # Render/Heroku costumam fornecer 'postgres://'
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql://", 1)
+    return url
+
+
+# 1) Lê a URL do ambiente (produção) ou cai para SQLite (dev)
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_URL = _normalize_db_url(DATABASE_URL)
+
+if not DATABASE_URL:
+    # Ajuste o caminho do seu arquivo SQLite local, se necessário
+    DATABASE_URL = "sqlite:///./data/app.sqlite"
+
+# 2) Parâmetros específicos por driver
+connect_args = {}
+engine_kwargs = {}
+
+if DATABASE_URL.startswith("sqlite"):
+    # SQLite precisa desse parâmetro quando usado em apps web (threads)
+    connect_args = {"check_same_thread": False}
+else:
+    # Em Postgres na nuvem, é melhor evitar um pool agressivo e habilitar pre_ping
+    engine_kwargs["poolclass"] = NullPool
+    engine_kwargs["pool_pre_ping"] = True
+
+# 3) Cria o engine
+engine = create_engine(
+    DATABASE_URL,
+    connect_args=connect_args,
+    **engine_kwargs,
+)
+
+# 4) Session factory e dependency para FastAPI
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def get_db():
+    """Dependency de sessão para FastAPI: abre/fecha a conexão por request."""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-
-# Opcional (dev): criar todas as tabelas com Base.metadata
-def create_all() -> None:
-    Base.metadata.create_all(bind=engine)

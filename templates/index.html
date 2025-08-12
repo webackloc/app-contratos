@@ -2,12 +2,14 @@
   =======================================================================================
   Projeto: Sistema de Gestão de Contratos
   Arquivo: templates/index.html
-  Versão: v1.5 - 2025-08-11
+  Versão: v1.6 - 2025-08-12
   Autor: Leonardo Muller
   Alterações nesta versão:
-    • Mantidos atalhos; texto ajustado para indicar que o Dashboard usa a API /api/dashboard/
-    • Padronização de versão no cabeçalho
+    • [REMOVIDO] Card de importação CSV do centro da página (opção permanece no menu).
+    • [MANTIDO] Cabeçalho com logo e observação do dashboard usando /api/dashboard/.
+    • [MANTIDO] Card "Atalhos Rápidos" com os mesmos links.
   Histórico:
+    v1.5 - 2025-08-11 - Mantidos atalhos; texto do dashboard aponta /api/dashboard/
     v1.4 - 2025-08-08 - Página inicial com logo, atalhos e upload funcional
   =======================================================================================
 #}
@@ -25,23 +27,7 @@
     <p class="text-muted small">O dashboard consome dados da API <code>/api/dashboard/</code>.</p>
   </div>
 
-  <div class="row justify-content-center">
-    <div class="col-md-8 col-lg-6">
-      <div class="card shadow-sm mb-4">
-        <div class="card-body">
-          <h5 class="card-title">📁 Importar Contratos via CSV</h5>
-          <form action="/upload" method="post" enctype="multipart/form-data">
-            <div class="mb-3">
-              <label for="file" class="form-label">Selecione o arquivo CSV:</label>
-              <input class="form-control" type="file" name="file" id="file" accept=".csv" required>
-            </div>
-            <button type="submit" class="btn btn-primary w-100">Enviar</button>
-          </form>
-        </div>
-      </div>
-    </div>
-  </div>
-
+  {# Card de atalhos — permanece igual #}
   <div class="card shadow-sm">
     <div class="card-body">
       <h4 class="card-title">🔗 Atalhos Rápidos</h4>
@@ -53,5 +39,7 @@
       </ul>
     </div>
   </div>
+
+  {# Observação: a importação de CSV agora está acessível apenas pelo menu (base.html). #}
 </div>
 {% endblock %}
