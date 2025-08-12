@@ -1,0 +1,271 @@
+{# 
+  =======================================================================================
+  Projeto: Sistema de Gestão de Contratos
+  Arquivo: templates/dashboard.html
+  Versão: v2.0 - 2025-08-11
+  Alterações:
+    • "Quantidade de Itens por Cliente" (Top 10) — backend já limita.
+    • Removido "Distribuição por Meses Restantes".
+    • Novo gráfico: "📅 Valores Mensais a Vencer por Trimestre"
+      (1º 0–3, 2º 4–6, 3º 7–9, 4º 10–12 e "Restante > 12m").
+  Base: v1.9.1 enviada anteriormente.
+  =======================================================================================
+#}
+
+{% extends "base.html" %}
+{% block title %}Dashboard de Contratos{% endblock %}
+
+{% block content %}
+<h2 class="d-flex align-items-center gap-3">
+  <span>📊 Visão Geral dos Contratos</span>
+  <small id="chips-filtros" class="d-inline-flex flex-wrap gap-2"></small>
+</h2>
+
+<form id="form-filtros" class="row g-2 align-items-end mt-1 mb-3 position-relative">
+  <div class="col-12 col-md-4">
+    <label for="f-cliente" class="form-label">Cliente (contém)</label>
+    <input type="text" id="f-cliente" class="form-control" placeholder="Ex.: ACME" autocomplete="off">
+    <div id="sugestoes" class="list-group shadow position-absolute w-100" 
+         style="z-index:1050; display:none; max-height:260px; overflow:auto;"></div>
+  </div>
+  <div class="col-6 col-md-3">
+    <label for="f-de" class="form-label">De</label>
+    <input type="date" id="f-de" class="form-control">
+  </div>
+  <div class="col-6 col-md-3">
+    <label for="f-ate" class="form-label">Até</label>
+    <input type="date" id="f-ate" class="form-control">
+  </div>
+  <div class="col-12 col-md-2 d-grid">
+    <button type="submit" class="btn btn-primary">Aplicar</button>
+  </div>
+</form>
+
+<div id="resumo"></div>
+
+<div class="row mt-3">
+  <div class="col-md-3">
+    <div class="card text-bg-primary mb-3">
+      <div class="card-body">
+        <h5 class="card-title">Total de Contratos</h5>
+        <p class="card-text fs-4 fw-bold" id="totalContratos">...</p>
+        <div class="small">
+          <span class="badge bg-light text-dark me-1">com itens: <span id="totalContratosComItens">—</span></span>
+          <span class="badge bg-light text-dark">itens: <span id="totalItensContrato">—</span></span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card text-bg-success mb-3">
+      <div class="card-body">
+        <h5 class="card-title">Valor Mensal Total</h5>
+        <p class="card-text fs-4 fw-bold"><span id="valorMensal">...</span></p>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card text-bg-warning mb-3">
+      <div class="card-body">
+        <h5 class="card-title">Valor Global Total</h5>
+        <p class="card-text fs-4 fw-bold"><span id="valorGlobal">...</span></p>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card text-bg-info mb-3">
+      <div class="card-body">
+        <h5 class="card-title">Valor Presente Total</h5>
+        <p class="card-text fs-4 fw-bold"><span id="valorPresente">...</span></p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<hr>
+
+<div class="row gy-4">
+  <div class="col-md-6">
+    <h5>📈 Valor Mensal adicionado</h5>
+    <div class="ratio ratio-16x9">
+      <canvas id="graficoMesEnvio"></canvas>
+    </div>
+  </div>
+
+  <div class="col-md-6">
+    <h5>🧮 Quantidade de Itens por Cliente (Top 10)</h5>
+    <div class="ratio ratio-16x9">
+      <canvas id="graficoPorCliente"></canvas>
+    </div>
+  </div>
+
+  <div class="col-md-6">
+    <h5>💰 Valor Presente por Cliente (Top 10)</h5>
+    <div class="ratio ratio-16x9">
+      <canvas id="graficoValorPorCliente"></canvas>
+    </div>
+  </div>
+
+  <div class="col-md-6">
+    <h5>📅 Valores Mensais a Vencer por Trimestre</h5>
+    <div class="ratio ratio-16x9">
+      <canvas id="graficoTrimestres"></canvas>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+(function(){
+  const API = { DASH: "/api/dashboard/", CLIENTES: "/api/dashboard/clientes" };
+  const fmtMoney = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL", maximumFractionDigits: 2 });
+  const fmtInt = new Intl.NumberFormat("pt-BR");
+
+  const elTotal = document.getElementById("totalContratos");
+  const elTotalComItens = document.getElementById("totalContratosComItens");
+  const elTotalItens = document.getElementById("totalItensContrato");
+  const elMensal = document.getElementById("valorMensal");
+  const elGlobal = document.getElementById("valorGlobal");
+  const elPresente = document.getElementById("valorPresente");
+  const elResumo = document.getElementById("resumo");
+  const chips = document.getElementById("chips-filtros");
+
+  const fForm = document.getElementById("form-filtros");
+  const fCliente = document.getElementById("f-cliente");
+  const fDe = document.getElementById("f-de");
+  const fAte = document.getElementById("f-ate");
+  const sug = document.getElementById("sugestoes");
+
+  let chMesEnvio, chQtdCliente, chValorCliente, chTrimestres;
+  let timer;
+
+  // ---- Autocomplete clientes ----
+  function debounce(fn, ms){ return function(...a){ clearTimeout(timer); timer = setTimeout(()=>fn.apply(this,a), ms); } }
+  async function carregarSugestoes(){
+    const q = fCliente.value.trim();
+    const url = q ? `${API.CLIENTES}?q=${encodeURIComponent(q)}&limit=20` : `${API.CLIENTES}?limit=20`;
+    const resp = await fetch(url);
+    if(!resp.ok) return (sug.style.display = "none");
+    const data = await resp.json();
+    sug.innerHTML = "";
+    (data.clientes || []).forEach(nome=>{
+      const a = document.createElement("button");
+      a.type = "button";
+      a.className = "list-group-item list-group-item-action";
+      a.textContent = nome || "N/D";
+      a.onclick = ()=>{ fCliente.value = nome || ""; sug.style.display = "none"; fForm.requestSubmit(); };
+      sug.appendChild(a);
+    });
+    sug.style.display = (data.clientes && data.clientes.length) ? "block" : "none";
+  }
+  fCliente.addEventListener("focus", carregarSugestoes);
+  fCliente.addEventListener("input", debounce(carregarSugestoes, 200));
+  document.addEventListener("click", (e)=>{ if(!sug.contains(e.target) && e.target!==fCliente) sug.style.display="none"; });
+
+  // ---- Dashboard ----
+  function buildQuery(){
+    const p = new URLSearchParams();
+    if(fCliente.value.trim()) p.set("cliente", fCliente.value.trim());
+    if(fDe.value) p.set("de", fDe.value);
+    if(fAte.value) p.set("ate", fAte.value);
+    return p.toString() ? ("?" + p.toString()) : "";
+  }
+  function renderChips(){
+    chips.innerHTML = "";
+    const list = [];
+    if(fCliente.value.trim()) list.push("Cliente: " + fCliente.value.trim());
+    if(fDe.value) list.push("De: " + fDe.value);
+    if(fAte.value) list.push("Até: " + fAte.value);
+    (list.length ? list : ["Sem filtros"]).forEach((t)=>{
+      const span = document.createElement("span");
+      span.className = "badge " + (list.length? "bg-dark":"bg-secondary");
+      span.textContent = t;
+      chips.append(span);
+    });
+  }
+
+  async function carregarDashboard() {
+    try {
+      elResumo.innerHTML = "";
+      setKpis("...", "...", "...", "...", "...", "...");
+      const qs = buildQuery();
+      const resp = await fetch(API.DASH + qs, { headers: {"Accept":"application/json"} });
+      if (!resp.ok) throw new Error("Falha ao buscar dados do dashboard ("+resp.status+")");
+      const d = await resp.json();
+
+      setKpis(
+        fmtInt.format(d.total_contratos ?? 0),
+        fmtInt.format(d.total_contratos_com_itens ?? 0),
+        fmtInt.format(d.total_itens_contrato ?? 0),
+        fmtMoney.format(d.valor_mensal_total ?? 0),
+        fmtMoney.format(d.valor_global_total ?? 0),
+        fmtMoney.format(d.valor_presente_total ?? 0),
+      );
+
+      // 1) Valor Mensal adicionado (12 meses fixos do backend)
+      const porMesLabels = (d.mensal_por_mes ?? []).map(x => x.mes);
+      const porMesData   = (d.mensal_por_mes ?? []).map(x => x.valor ?? 0);
+      chMesEnvio = upsertChart(
+        chMesEnvio, document.getElementById("graficoMesEnvio"),
+        { type: "bar",
+          data: { labels: porMesLabels, datasets: [{ label: "Valor mensal (R$)", data: porMesData }] },
+          options: { responsive:true, maintainAspectRatio:false, scales:{ y:{ ticks:{ callback:v=>fmtMoney.format(v) } } } } }
+      );
+
+      // 2) Quantidade de Itens por Cliente (Top 10) — back já limita
+      const qtdCliLabels = (d.qtd_por_cliente ?? []).map(x => x.cliente || "N/D");
+      const qtdCliData   = (d.qtd_por_cliente ?? []).map(x => x.quantidade ?? 0);
+      chQtdCliente = upsertChart(
+        chQtdCliente, document.getElementById("graficoPorCliente"),
+        { type: "bar",
+          data: { labels: qtdCliLabels, datasets: [{ label: "Qtd. Itens", data: qtdCliData }] },
+          options: { responsive:true, maintainAspectRatio:false, indexAxis: qtdCliLabels.length>10 ? "y" : "x" } }
+      );
+
+      // 3) Valor Presente por Cliente (Top 10)
+      const valRows = (d.valor_presente_por_cliente && d.valor_presente_por_cliente.length)
+                      ? d.valor_presente_por_cliente
+                      : (d.valor_global_por_cliente || []);
+      const valCliLabels = valRows.map(x => x.cliente || "N/D");
+      const valCliData   = valRows.map(x => x.valor ?? 0);
+      chValorCliente = upsertChart(
+        chValorCliente, document.getElementById("graficoValorPorCliente"),
+        { type: "bar",
+          data: { labels: valCliLabels, datasets: [{ label: "Valor Presente (R$)", data: valCliData }] },
+          options: { responsive:true, maintainAspectRatio:false,
+                     indexAxis: valCliLabels.length>10 ? "y" : "x",
+                     scales:{ y:{ ticks:{ callback:v=>fmtMoney.format(v) } } } } }
+      );
+
+      // 4) NOVO: Valores Mensais a Vencer por Trimestre
+      const triLabels = (d.vencimento_trimestres ?? []).map(x => x.bucket);
+      const triData   = (d.vencimento_trimestres ?? []).map(x => x.valor ?? 0);
+      chTrimestres = upsertChart(
+        chTrimestres, document.getElementById("graficoTrimestres"),
+        { type: "bar",
+          data: { labels: triLabels, datasets: [{ label: "Valor mensal (R$)", data: triData }] },
+          options: { responsive:true, maintainAspectRatio:false,
+                     scales:{ y:{ ticks:{ callback:v=>fmtMoney.format(v) } } } } }
+      );
+
+      renderChips();
+
+    } catch (err) {
+      console.error(err);
+      elResumo.innerHTML = "<p class='text-danger'>Erro ao carregar os dados do dashboard.</p>";
+      setKpis("erro","erro","erro","erro","erro","erro");
+    }
+  }
+
+  function setKpis(a,b,c,d,e,f){ elTotal.textContent=a; elTotalComItens.textContent=b; elTotalItens.textContent=c; elMensal.textContent=d; elGlobal.textContent=e; elPresente.textContent=f; }
+  function upsertChart(current, canvas, config){
+    if(!canvas) return null;
+    if(current){ current.data=config.data; current.options=config.options; current.update(); return current; }
+    return new Chart(canvas.getContext("2d"), config);
+  }
+
+  fForm.addEventListener("submit", function(e){ e.preventDefault(); carregarDashboard(); });
+  document.addEventListener("DOMContentLoaded", ()=>{ carregarDashboard(); renderChips(); });
+})();
+</script>
+{% endblock %}

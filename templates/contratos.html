@@ -1,0 +1,54 @@
+{# v1.2 - Ajustado para compatibilidade com rota FastAPI e modelo 'Contrato' #}
+{# v1.1 - Estilo com tabela Bootstrap responsiva #}
+{# v1.0 - Listagem de contratos em tabela HTML #}
+
+{% extends "base.html" %}
+
+{% block title %}Lista de Contratos{% endblock %}
+
+{% block content %}
+<h2>📄 Lista de Contratos</h2>
+
+<div class="table-responsive mt-3">
+    <table class="table table-bordered table-striped table-hover table-sm">
+        <thead class="table-dark">
+            <tr>
+                <th>ID</th>
+                <th>Ativo</th>
+                <th>Serial</th>
+                <th>Código Produto</th>
+                <th>Descrição</th>
+                <th>Cód. Cliente</th>
+                <th>Nome Cliente</th>
+                <th>Data Envio</th>
+                <th>Contrato Nº</th>
+                <th>Valor Mensal</th>
+                <th>Período Contratual</th>
+                <th>Meses Restantes</th>
+                <th>Valor Global</th>
+                <th>Valor Presente</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for c in contratos %}
+            <tr>
+                <td>{{ c.id }}</td>
+                <td>{{ c.ativo }}</td>
+                <td>{{ c.serial }}</td>
+                <td>{{ c.cod_pro }}</td>
+                <td>{{ c.descricao_produto }}</td>
+                <td>{{ c.cod_cli }}</td>
+                <td>{{ c.nome_cli }}</td>
+                <td>{{ c.data_envio.strftime('%d/%m/%Y') if c.data_envio else '' }}</td>
+                <td>{{ c.contrato_n }}</td>
+                <td>R$ {{ "{:,.2f}".format(c.valor_mensal) }}</td>
+                <td>{{ c.periodo_contratual }}</td>
+                <td>{{ c.meses_restantes }}</td>
+                <td>R$ {{ "{:,.2f}".format(c.valor_global_contrato) }}</td>
+                <td>R$ {{ "{:,.2f}".format(c.valor_presente_contrato) }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

@@ -1,0 +1,53 @@
+<!-- validar_importacao.html -->
+<!--
+Versão: 1.0.0
+Data: 2025-08-06
+Finalidade: Revisão pré-importação de movimentação de itens (ENVIO, RETORNO, TROCA)
+Autor: Leonardo Muller
+-->
+
+{% extends "base.html" %}
+{% block title %}Validar Importação{% endblock %}
+
+{% block content %}
+<div class="container">
+  <h2 class="mb-4">Revisão da Importação</h2>
+
+  <form action="/confirmar_importacao" method="post">
+    <input type="hidden" name="mapeamento_json" value='{{ mapeamento_json }}'>
+    <input type="hidden" name="dados_json" value='{{ dados_json }}'>
+
+    <table class="table table-bordered">
+      <thead class="table-light">
+        <tr>
+          <th>Ativo</th>
+          <th>Contrato Nº</th>
+          <th>Cliente</th>
+          <th>TP Transação</th>
+          <th>Ação Esperada</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in itens %}
+        <tr class="{% if item.acao == 'TROCA' %}table-warning{% elif item.acao == 'RETORNO' %}table-danger{% elif item.acao == 'ENVIO' %}table-success{% endif %}">
+          <td>{{ item.ativo }}</td>
+          <td>{{ item.contrato_num }}</td>
+          <td>{{ item.nome_cli }}</td>
+          <td>{{ item.tp_transacao }}</td>
+          <td><strong>{{ item.acao }}</strong></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <div class="d-flex justify-content-between mt-4">
+      <a href="/importar_movimentacao" class="btn btn-secondary">
+        <i class="bi bi-arrow-left"></i> Cancelar
+      </a>
+      <button type="submit" class="btn btn-primary">
+        <i class="bi bi-upload"></i> Confirmar Importação
+      </button>
+    </div>
+  </form>
+</div>
+{% endblock %}

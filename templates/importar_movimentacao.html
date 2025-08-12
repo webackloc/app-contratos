@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Importar Movimentação de Itens{% endblock %}
+
+{% block content %}
+<div class="container">
+    <h2 class="mb-4">Importação de Movimentação de Itens</h2>
+
+    <!-- Passo 1: Upload do CSV -->
+    {% if not headers %}
+        <div class="alert alert-info">
+            Envie um arquivo CSV contendo os itens com a coluna <strong><code>tp_transacao</code></strong> preenchida com: <code>ENVIO</code>, <code>RETORNO</code> ou <code>TROCA</code>.
+            <br><br>
+            A coluna <strong><code>período</code></strong> <strong>não</strong> deve ser enviada — ela será preenchida automaticamente com base no cabeçalho do contrato (relacionando <code>cod_cli</code> + <code>contrato_n</code>).
+        </div>
+
+        <form action="/importar_movimentacao" method="post" enctype="multipart/form-data">
+            <div class="mb-3">
+                <label for="file" class="form-label">Selecione o arquivo CSV:</label>
+                <input class="form-control" type="file" id="file" name="file" accept=".csv" required>
+            </div>
+            <button type="submit" class="btn btn-primary">
+                <i class="bi bi-upload"></i> Enviar Arquivo
+            </button>
+        </form>
+
+    {% else %}
+        <!-- Passo 2: Mapeamento das colunas -->
+        <div class="alert alert-warning">
+            <strong>Passo 2:</strong> Mapeie as colunas do seu arquivo CSV com os campos do sistema.
+        </div>
+
+        <form action="/processar_movimentacao" method="post">
+            <input type="hidden" name="csv_path" value="{{ csv_path }}">
+
+            <div class="row">
+                {% for field in required_fields %}
+                <div class="col-md-6 mb-3">
+                    <label class="form-label">Campo <strong>{{ field }}</strong></label>
+                    <select name="map_{{ field }}" class="form-select" required>
+                        <option value="" disabled selected>Selecione a coluna correspondente</option>
+                        {% for header in headers %}
+                        <option value="{{ header }}">{{ header }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                {% endfor %}
+            </div>
+
+            <button type="submit" class="btn btn-success">
+                <i class="bi bi-play-circle"></i> Processar Importação
+            </button>
+        </form>
+    {% endif %}
+</div>
+{% endblock %}
+
+<!--
+Versão: 1.2.0
+Data: 2025-08-06
+Alterações:
+- Inclusão do passo 2: mapeamento das colunas do CSV com os campos do sistema
+- Mantida a lógica de upload existente
+- Adicionado suporte ao caminho temporário do CSV via campo oculto
+- Layout preservado com Bootstrap 5
+-->

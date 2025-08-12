@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Upload de Contratos</title>
+</head>
+<body>
+  <h1>Importar Contratos (CSV)</h1>
+  <form id="upload-form" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".csv" required />
+    <button type="submit">Enviar</button>
+  </form>
+
+  <div id="mensagens" style="margin-top: 20px;"></div>
+
+  <script>
+    const form = document.getElementById("upload-form");
+    const mensagens = document.getElementById("mensagens");
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      mensagens.innerHTML = ""; // limpar mensagens
+
+      const formData = new FormData(form);
+
+      try {
+        const response = await fetch("/upload_csv", {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!response.ok) {
+          const erro = await response.json();
+          mensagens.innerHTML = "<h3 style='color:red;'>Erros encontrados:</h3><ul>" +
+            erro.detail.map(e => `<li style="color:red;">${e}</li>`).join("") + "</ul>";
+        } else {
+          const resultado = await response.json();
+          mensagens.innerHTML = `<p style="color:green;">${resultado.status}</p>`;
+        }
+      } catch (err) {
+        mensagens.innerHTML = `<p style="color:red;">Erro ao enviar: ${err.message}</p>`;
+      }
+    });
+  </script>
+</body>
+</html>

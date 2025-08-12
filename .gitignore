@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.sqlite*
+*.db
+
+# Venv
+venv/
+.venv/
+
+# Logs e runtime
+runtime/
+*.log
+*.jsonl
+
+# Env
+.env
+.env.*.local
+
+# Node (se usar front)
+node_modules/
+dist/

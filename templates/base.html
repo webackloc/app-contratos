@@ -1,0 +1,111 @@
+{# ============================================================================
+   base.html – Versão 2.9.3 (11/08/2025)
+   CHANGELOG:
+     - [fix] Fecha corretamente o bloco Jinja "{% block scripts %}{% endblock %}".
+     - [=] Mantém dropdown "Usuário" e link "Usuários".
+     - [robust] Checagens seguras para sessão.
+   ============================================================================ #}
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="x-app-version" content="base.html v2.9.3" />
+  <title>{% block title %}Sistema de Contratos{% endblock %}</title>
+
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/estilos.css" />
+
+  <style>
+    .navbar-dark .navbar-nav .nav-link { color: #f8f9fa !important; }
+    .navbar-dark .navbar-nav .nav-link:hover { color: #ffffff !important; text-decoration: underline; }
+    .navbar-dark .navbar-nav .nav-link.active { font-weight: 600; text-decoration: underline; }
+    .navbar-dark .navbar-text { color: #f8f9fa !important; }
+    .dropdown-menu { min-width: 14rem; }
+  </style>
+</head>
+<body>
+  {% set _has_request = request is defined %}
+  {% set _has_session = _has_request and (request.session is defined) %}
+  {% set _uid = request.session.get('user_id') if _has_session else None %}
+  {% set _username = request.session.get('username') if _has_session else None %}
+  {% set _is_admin = request.session.get('is_admin') if _has_session else None %}
+  {% set _is_admin_truthy = _is_admin in [True, 1, '1', 'true', 'True'] %}
+
+  <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
+    <div class="container-fluid">
+      <a class="navbar-brand" href="/">Gestão de Contratos</a>
+      <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav" aria-label="Alternar navegação">
+        <span class="navbar-toggler-icon"></span>
+      </button>
+
+      <div class="collapse navbar-collapse" id="navbarNav">
+        <!-- Esquerda -->
+        <ul class="navbar-nav me-auto">
+          <li class="nav-item"><a class="nav-link" href="/dashboard">Dashboard</a></li>
+          <li class="nav-item"><a class="nav-link" href="/contratos_html">Contratos</a></li>
+          <li class="nav-item"><a class="nav-link" href="/cadastrar">Cadastro Manual</a></li>
+          <li class="nav-item"><a class="nav-link" href="/upload">Importar Contratos</a></li>
+          <li class="nav-item"><a class="nav-link" href="/importar_movimentacao">Movimentação</a></li>
+          <li class="nav-item"><a class="nav-link" href="/ultima_importacao">Última Importação</a></li>
+        </ul>
+
+        <!-- Direita -->
+        <ul class="navbar-nav">
+          {% if _uid %}
+            <li class="nav-item dropdown">
+              <a class="nav-link dropdown-toggle" href="#" id="userDropdown" role="button"
+                 data-bs-toggle="dropdown" aria-expanded="false">
+                 Olá, {{ _username or 'usuário' }}
+              </a>
+              <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="userDropdown">
+                <!-- Exibir para qualquer logado por enquanto -->
+                <li><a class="dropdown-item" href="/admin/users">Usuários</a></li>
+                {# Para restringir a admin apenas, troque por:
+                   {% if _is_admin_truthy %}<li><a class="dropdown-item" href="/admin/users">Usuários</a></li>{% endif %}
+                #}
+                <li><hr class="dropdown-divider"></li>
+                <li><a class="dropdown-item" href="/logout">Sair</a></li>
+              </ul>
+            </li>
+          {% else %}
+            <li class="nav-item"><a class="nav-link" href="/login">Entrar</a></li>
+          {% endif %}
+        </ul>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="text-center mt-5 mb-3 text-muted">
+    <small>&copy; <span id="footer-year">{{ ano }}</span> - Sistema de Contratos</small>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    (function() {
+      var y = document.getElementById('footer-year');
+      if (y && (!y.textContent || !y.textContent.trim())) {
+        y.textContent = String(new Date().getFullYear());
+      }
+      var path = window.location.pathname.replace(/\/+$/, '');
+      var items = document.querySelectorAll('.navbar .nav-link');
+      items.forEach(function(a) {
+        try {
+          var ahref = a.getAttribute('href') || '';
+          var clean = ahref.replace(/\/+$/, '');
+          if (clean === '') clean = '/';
+          if (path === clean || (clean !== '/' && path.startsWith(clean))) {
+            a.classList.add('active');
+          }
+        } catch (e) {}
+      });
+    })();
+  </script>
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>

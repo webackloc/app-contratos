@@ -1,0 +1,96 @@
+{# =========================================================================
+   templates/cadastrar.html
+   Versão: v1.3.2 - 2025-08-11
+   CHANGELOG:
+     - [*] Mantém o campo do formulário como "contrato_num" (compatível com versões anteriores).
+     - [+] Backend agora aceita "contrato_num" OU "contrato_n".
+     - [+] Exibição de mensagens de erro (quando o backend retornar "erro" no contexto).
+     - [*] Tabela de contratos: fallback para mostrar contrato_n ou contrato_num.
+   ========================================================================= #}
+{% extends "base.html" %}
+{% block title %}Cadastrar Contrato{% endblock %}
+
+{% block content %}
+<h2>📝 Cadastrar Novo Contrato</h2>
+
+{% if erro %}
+<div class="alert alert-danger">{{ erro }}</div>
+{% endif %}
+
+<form method="post" action="/cadastrar" class="row g-3 mt-3">
+
+  <div class="col-md-6">
+    <label for="nome_cliente" class="form-label">Nome do Cliente</label>
+    <input type="text" class="form-control" id="nome_cliente" name="nome_cliente" required>
+  </div>
+
+  <div class="col-md-6">
+    <label for="cnpj" class="form-label">CNPJ</label>
+    <input type="text" class="form-control" id="cnpj" name="cnpj" required>
+  </div>
+
+  <div class="col-md-4">
+    <label for="contrato_num" class="form-label">Contrato Nº</label>
+    <input type="text" class="form-control" id="contrato_num" name="contrato_num" required>
+  </div>
+
+  <div class="col-md-4">
+    <label for="prazo_contratual" class="form-label">Prazo Contratual (meses)</label>
+    <input type="number" class="form-control" id="prazo_contratual" name="prazo_contratual" min="1" step="1" required>
+  </div>
+
+  <div class="col-md-4">
+    <label for="indice_reajuste" class="form-label">Índice de Reajuste (%)</label>
+    <input type="number" step="0.01" class="form-control" id="indice_reajuste" name="indice_reajuste" required>
+  </div>
+
+  <div class="col-md-6">
+    <label for="vendedor" class="form-label">Vendedor</label>
+    <input type="text" class="form-control" id="vendedor" name="vendedor" required>
+  </div>
+
+  <div class="col-12 d-flex gap-2">
+    <button type="submit" class="btn btn-primary">Salvar Contrato</button>
+    <a href="/contratos_html" class="btn btn-outline-secondary">Ver Contratos</a>
+  </div>
+</form>
+
+<script>
+  // Máscara simples de CNPJ
+  document.getElementById("cnpj").addEventListener("input", function (e) {
+    let value = e.target.value.replace(/\D/g, "");
+    value = value.replace(/^(\d{2})(\d)/, "$1.$2");
+    value = value.replace(/^(\d{2})\.(\d{3})(\d)/, "$1.$2.$3");
+    value = value.replace(/\.(\d{3})(\d)/, ".$1/$2");
+    value = value.replace(/(\d{4})(\d)/, "$1-$2");
+    e.target.value = value;
+  });
+</script>
+
+<hr class="mt-5 mb-4">
+<h4>📋 Contratos Cadastrados</h4>
+<table class="table table-striped">
+  <thead>
+    <tr>
+      <th>Cliente</th>
+      <th>CNPJ</th>
+      <th>Contrato Nº</th>
+      <th>Prazo</th>
+      <th>Índice</th>
+      <th>Vendedor</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for contrato in contratos %}
+    <tr>
+      <td>{{ contrato.nome_cliente }}</td>
+      <td>{{ contrato.cnpj }}</td>
+      <td>{{ contrato.contrato_n or contrato.contrato_num }}</td>
+      <td>{{ contrato.prazo_contratual }}</td>
+      <td>{{ contrato.indice_reajuste }}</td>
+      <td>{{ contrato.vendedor }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

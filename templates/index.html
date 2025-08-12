@@ -1,0 +1,57 @@
+{# 
+  =======================================================================================
+  Projeto: Sistema de Gestão de Contratos
+  Arquivo: templates/index.html
+  Versão: v1.5 - 2025-08-11
+  Autor: Leonardo Muller
+  Alterações nesta versão:
+    • Mantidos atalhos; texto ajustado para indicar que o Dashboard usa a API /api/dashboard/
+    • Padronização de versão no cabeçalho
+  Histórico:
+    v1.4 - 2025-08-08 - Página inicial com logo, atalhos e upload funcional
+  =======================================================================================
+#}
+
+{% extends "base.html" %}
+
+{% block title %}Início - Sistema de Contratos{% endblock %}
+
+{% block content %}
+<div class="container py-4">
+  <div class="text-center mb-4">
+    <img src="/static/images/logo.png" alt="Logo da Aplicação" style="max-height: 100px;">
+    <h1 class="mt-3">Bem-vindo ao Sistema de Gestão de Contratos</h1>
+    <p class="lead">Gerencie contratos, movimentações e relatórios com facilidade.</p>
+    <p class="text-muted small">O dashboard consome dados da API <code>/api/dashboard/</code>.</p>
+  </div>
+
+  <div class="row justify-content-center">
+    <div class="col-md-8 col-lg-6">
+      <div class="card shadow-sm mb-4">
+        <div class="card-body">
+          <h5 class="card-title">📁 Importar Contratos via CSV</h5>
+          <form action="/upload" method="post" enctype="multipart/form-data">
+            <div class="mb-3">
+              <label for="file" class="form-label">Selecione o arquivo CSV:</label>
+              <input class="form-control" type="file" name="file" id="file" accept=".csv" required>
+            </div>
+            <button type="submit" class="btn btn-primary w-100">Enviar</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card shadow-sm">
+    <div class="card-body">
+      <h4 class="card-title">🔗 Atalhos Rápidos</h4>
+      <ul class="list-group list-group-flush">
+        <li class="list-group-item"><a href="/dashboard">📊 Ver Dashboard de Contratos</a></li>
+        <li class="list-group-item"><a href="/cadastrar">➕ Cadastrar Contrato Manualmente</a></li>
+        <li class="list-group-item"><a href="/contratos_html">📋 Listar Todos os Contratos</a></li>
+        <li class="list-group-item"><a href="/docs" target="_blank">📘 Ver API (Swagger)</a></li>
+      </ul>
+    </div>
+  </div>
+</div>
+{% endblock %}
