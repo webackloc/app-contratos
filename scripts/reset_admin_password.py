@@ -21,7 +21,7 @@ if not DB_URL:
 # hash da senha
 try:
     from passlib.hash import bcrypt
-except Exception as ex:
+except Exception:
     print("ERRO: 'passlib[bcrypt]' não instalado. Adicione 'passlib[bcrypt]>=1.7.4' ao requirements.txt.")
     sys.exit(1)
 
@@ -40,15 +40,6 @@ def main():
             print("ERRO: não achei coluna de senha na tabela 'users'. Colunas:", cols)
             sys.exit(1)
 
-        # colunas NOT NULL sem default
-        meta = conn.execute(text("""
-            select column_name, is_nullable, column_default
-            from information_schema.columns
-            where table_schema='public' and table_name='users'
-        """)).all()
-        required = {name for (name, nullable, default) in meta
-                    if nullable == 'NO' and default is None}
-
         h = bcrypt.hash(args.new_password)
 
         # tenta atualizar usuário existente
@@ -65,16 +56,17 @@ def main():
             if "is_admin"  in cols: values["is_admin"]  = True
             if "role"      in cols: values["role"]      = "admin"
 
-            # preencher NOT NULL típicos
-            if "email" in required and "email" not in values:
+            # preencher auxiliares se existirem
+            if "email" in cols and "email" not in values:
                 values["email"] = f"{args.username}@local"
-            if "name" in required and "name" not in values:
+            if "name" in cols and "name" not in values:
                 values["name"] = args.username.title()
 
+            # SEMPRE setar timestamps se existirem
             now = datetime.now(timezone.utc)
-            if "created_at" in required and "created_at" not in values:
+            if "created_at" in cols and "created_at" not in values:
                 values["created_at"] = now
-            if "updated_at" in required and "updated_at" not in values:
+            if "updated_at" in cols and "updated_at" not in values:
                 values["updated_at"] = now
 
             insert_cols = list(values.keys())
