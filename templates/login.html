@@ -1,4 +1,4 @@
-<!-- templates/login.html — v1.0.0 (11/08/2025) -->
+<!-- templates/login.html — v3.9.17-deploy-2025-08-12 -->
 <!doctype html>
 <html lang="pt-br">
 <head>
@@ -14,24 +14,57 @@
         <div class="card shadow-sm">
           <div class="card-body">
             <h4 class="mb-3">Acessar o sistema</h4>
-            {% if erro %}<div class="alert alert-danger py-2">{{ erro }}</div>{% endif %}
-            <form method="post" action="/login">
+
+            {% if erro %}
+              <div class="alert alert-danger py-2">{{ erro }}</div>
+            {% endif %}
+
+            <form id="loginForm" method="post" action="/login" autocomplete="off" novalidate>
               <div class="mb-2">
-                <label class="form-label">Usuário</label>
-                <input name="username" class="form-control" required autofocus>
+                <label class="form-label" for="username">Usuário</label>
+                <input id="username" name="username" class="form-control" required autofocus
+                       value="{{ request.query_params.get('u','') }}">
               </div>
+
               <div class="mb-3">
-                <label class="form-label">Senha</label>
-                <input name="password" type="password" class="form-control" required>
+                <label class="form-label" for="password">Senha</label>
+                <div class="input-group">
+                  <input id="password" name="password" type="password" class="form-control" required>
+                  <button class="btn btn-outline-secondary" type="button" id="togglePwd" aria-label="Mostrar/ocultar senha">
+                    👁️
+                  </button>
+                </div>
               </div>
+
+              <!-- mantém a mesma lógica do arquivo anterior para rota de retorno -->
               <input type="hidden" name="next" value="{{ request.query_params.get('next', '/dashboard') }}">
-              <button class="btn btn-primary w-100">Entrar</button>
+
+              <button id="btnEntrar" class="btn btn-primary w-100">Entrar</button>
             </form>
           </div>
         </div>
-        <p class="text-center text-muted mt-3">© {{ now().year if now else '' }}</p>
+
+        <p class="text-center text-muted mt-3">
+          © {{ (current_year if current_year is defined else (now().year if now is defined else '')) }}
+        </p>
       </div>
     </div>
   </div>
+
+  <script>
+    // Mostrar/ocultar senha
+    document.getElementById('togglePwd').addEventListener('click', function() {
+      const pwd = document.getElementById('password');
+      pwd.type = (pwd.type === 'password') ? 'text' : 'password';
+      this.textContent = (pwd.type === 'password') ? '👁️' : '🙈';
+    });
+
+    // Evita reenvio duplo
+    document.getElementById('loginForm').addEventListener('submit', function() {
+      const btn = document.getElementById('btnEntrar');
+      btn.setAttribute('disabled', 'disabled');
+      btn.textContent = 'Entrando...';
+    });
+  </script>
 </body>
 </html>
