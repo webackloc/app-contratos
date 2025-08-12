@@ -28,47 +28,64 @@ except Exception as ex:
 def main():
     engine = create_engine(DB_URL, pool_pre_ping=True)
     with engine.begin() as conn:
-        # identifica coluna de senha na tabela users
+        # colunas existentes na tabela
         cols = [r[0] for r in conn.execute(text(
             "select column_name from information_schema.columns "
             "where table_schema='public' and table_name='users'"
         ))]
 
+        # identifica a coluna de senha
         passcol = None
         for candidate in ("password_hash", "hashed_password", "password"):
             if candidate in cols:
                 passcol = candidate
                 break
-
         if not passcol:
             print("ERRO: não achei coluna de senha na tabela 'users'. Colunas:", cols)
             sys.exit(1)
 
-        # hash
+        # quais colunas são NOT NULL e sem default?
+        meta = conn.execute(text("""
+            select column_name, is_nullable, column_default
+            from information_schema.columns
+            where table_schema='public' and table_name='users'
+        """)).all()
+        required = {name for (name, nullable, default) in meta if nullable == 'NO' and default is None}
+
+        # hash da nova senha
         h = bcrypt.hash(args.new_password)
 
-        # tenta atualizar
+        # tenta atualizar o usuário existente
         upd = conn.execute(
             text(f"update users set {passcol}=:h where username=:u"),
             {"h": h, "u": args.username},
         )
         if upd.rowcount == 0:
-            # cria usuário se não existe
+            # não existe -> criar usuário
             values = {"username": args.username, passcol: h}
-            extras = []
-            if "is_admin" in cols:
-                values["is_admin"] = True
-                extras.append("is_admin")
+
+            # preenche campos obrigatórios comuns
             if "is_active" in cols:
                 values["is_active"] = True
-                extras.append("is_active")
-            insert_cols = ["username", passcol] + extras
+            if "is_admin" in cols:
+                values["is_admin"] = True
+            if "role" in cols:
+                # atende NOT NULL de 'role' se houver
+                values["role"] = "admin"
+
+            # se 'email' e/ou 'name' forem NOT NULL sem default, preenche
+            if "email" in required and "email" not in values:
+                values["email"] = f"{args.username}@local"
+            if "name" in required and "name" not in values:
+                values["name"] = args.username.title()
+
+            insert_cols = list(values.keys())
             placeholders = ", ".join([f":{c}" for c in insert_cols])
             conn.execute(
                 text(f"insert into users ({', '.join(insert_cols)}) values ({placeholders})"),
                 values,
             )
-            print(f"Usuário criado: {args.username} (coluna de senha: {passcol})")
+            print(f"Usuário criado: {args.username} (senha definida; coluna de senha: {passcol})")
         else:
             print(f"Senha atualizada: {args.username} (coluna de senha: {passcol})")
 
