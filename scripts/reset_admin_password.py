@@ -1,55 +1,80 @@
-python - <<'PY'
-import os, sys
+import os
+import sys
+import argparse
 from sqlalchemy import create_engine, text
 
-# ---- ajuste aqui se quiser ----
-USER = "admin"              # username a resetar
-NEW  = "NovaSenha@2025!"    # senha provisória forte
-# -------------------------------
+# --- argumentos de linha de comando ---
+parser = argparse.ArgumentParser(description="Resetar/definir senha de um usuário (tabela 'users').")
+parser.add_argument("--username", "-u", default=os.getenv("ADMIN_USERNAME", "admin"),
+                    help="username a resetar (default: env ADMIN_USERNAME ou 'admin')")
+parser.add_argument("--new-password", "-p", dest="new_password",
+                    default=os.getenv("ADMIN_NEW_PASSWORD", "NovaSenha@2025!"),
+                    help="nova senha (default: env ADMIN_NEW_PASSWORD ou 'NovaSenha@2025!')")
+args = parser.parse_args()
 
-# tenta usar passlib (bcrypt). Se não houver, falha.
+# --- carrega URL do banco (Render usa DATABASE_URL) ---
+DB_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+if not DB_URL:
+    print("ERRO: defina DATABASE_URL (ou POSTGRES_URL) nas variáveis de ambiente.")
+    sys.exit(1)
+
+# --- prepara hash da senha ---
 try:
     from passlib.hash import bcrypt
 except Exception as ex:
-    print("Faltou 'passlib[bcrypt]' no requirements.txt:", ex)
+    print("ERRO: 'passlib[bcrypt]' não instalado. Adicione 'passlib[bcrypt]>=1.7.4' ao requirements.txt.")
     sys.exit(1)
 
-e = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+def main():
+    engine = create_engine(DB_URL, pool_pre_ping=True)
+    with engine.begin() as conn:
+        # identifica coluna de senha na tabela users
+        cols = [r[0] for r in conn.execute(text(
+            "select column_name from information_schema.columns "
+            "where table_schema='public' and table_name='users'"
+        ))]
 
-with e.begin() as c:
-    # identifica a coluna de senha
-    cols = [r[0] for r in c.execute(text(
-        "select column_name from information_schema.columns "
-        "where table_schema='public' and table_name='users'"
-    ))]
-    for passcol in ("password_hash", "hashed_password", "password"):
-        if passcol in cols:
-            break
-    else:
-        print("Não achei coluna de senha na tabela users. Colunas:", cols)
-        sys.exit(1)
+        passcol = None
+        for candidate in ("password_hash", "hashed_password", "password"):
+            if candidate in cols:
+                passcol = candidate
+                break
 
-    h = bcrypt.hash(NEW)
+        if not passcol:
+            print("ERRO: não achei coluna de senha na tabela 'users'. Colunas:", cols)
+            sys.exit(1)
 
-    # tenta atualizar o usuário
-    r = c.execute(
-        text(f"update users set {passcol}=:h where username=:u"),
-        {"h": h, "u": USER},
-    )
-    if r.rowcount == 0:
-        # se não existe, cria com flags padrões se houverem
-        values = {"username": USER, passcol: h}
-        extras_cols = []
-        if "is_admin" in cols:
-            extras_cols.append("is_admin"); values["is_admin"] = True
-        if "is_active" in cols:
-            extras_cols.append("is_active"); values["is_active"] = True
-        insert_cols = ["username", passcol] + extras_cols
-        placeholders = ", ".join([f":{c}" for c in insert_cols])
-        c.execute(text(f"insert into users ({', '.join(insert_cols)}) values ({placeholders})"), values)
-        print(f"Usuário criado: {USER} (coluna de senha: {passcol})")
-    else:
-        print(f"Senha atualizada para usuário: {USER} (coluna de senha: {passcol})")
+        # hash
+        h = bcrypt.hash(args.new_password)
 
-print("Use esta senha provisória para login agora:", NEW)
-PY
+        # tenta atualizar
+        upd = conn.execute(
+            text(f"update users set {passcol}=:h where username=:u"),
+            {"h": h, "u": args.username},
+        )
+        if upd.rowcount == 0:
+            # cria usuário se não existe
+            values = {"username": args.username, passcol: h}
+            extras = []
+            if "is_admin" in cols:
+                values["is_admin"] = True
+                extras.append("is_admin")
+            if "is_active" in cols:
+                values["is_active"] = True
+                extras.append("is_active")
+            insert_cols = ["username", passcol] + extras
+            placeholders = ", ".join([f":{c}" for c in insert_cols])
+            conn.execute(
+                text(f"insert into users ({', '.join(insert_cols)}) values ({placeholders})"),
+                values,
+            )
+            print(f"Usuário criado: {args.username} (coluna de senha: {passcol})")
+        else:
+            print(f"Senha atualizada: {args.username} (coluna de senha: {passcol})")
+
+    print("Login agora com:")
+    print(" - username:", args.username)
+    print(" - senha   :", args.new_password)
+
+if __name__ == "__main__":
+    main()
