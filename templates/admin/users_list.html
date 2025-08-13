@@ -1,1 +1,63 @@
+{# templates/admin/users_list.html — v1.1.0 (12/08/2025) #}
+{% extends "base.html" %}
+
+{% block title %}Usuários{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-3">
+  <div class="d-flex align-items-center justify-content-between mb-3">
+    <h4 class="mb-0">Usuários</h4>
+    <a href="/admin/users/novo" class="btn btn-primary btn-sm">+ Novo usuário</a>
+  </div>
+
+  {% if msg %}
+    <div class="alert alert-success py-2">{{ msg }}</div>
+  {% endif %}
+  {% if error %}
+    <div class="alert alert-danger py-2">{{ error }}</div>
+  {% endif %}
+
+  <div class="table-responsive">
+    <table class="table table-sm table-striped align-middle">
+      <thead>
+        <tr>
+          <th style="width: 80px;">ID</th>
+          <th>Usuário</th>
+          <th>Email</th>
+          <th style="width: 120px;">Admin</th>
+          <th style="width: 200px;">Criado em</th>
+          <th style="width: 220px;">Ações</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if users and users|length > 0 %}
+          {% for u in users %}
+          <tr>
+            <td><code>{{ u.id }}</code></td>
+            <td>{{ u.username or u.user_name or "-" }}</td>
+            <td>{{ u.email or "-" }}</td>
+            <td>
+              {% set is_admin = (u.is_admin if (u.is_admin is not none) else (u.role == 'admin' if u.role is defined else False)) %}
+              <span class="badge {{ 'bg-success' if is_admin else 'bg-secondary' }}">
+                {{ 'Sim' if is_admin else 'Não' }}
+              </span>
+            </td>
+            <td>{{ u.created_at or u.dt_created or u.created or '-' }}</td>
+            <td class="d-flex gap-2">
+              <a href="/admin/users/{{ u.id }}/senha" class="btn btn-outline-secondary btn-sm">Alterar senha</a>
+              <form action="/admin/users/{{ u.id }}/remover" method="post"
+                    onsubmit="return confirm('Remover o usuário {{ u.username or u.email or u.id }}?');">
+                <button type="submit" class="btn btn-outline-danger btn-sm">Remover</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        {% else %}
+          <tr><td colspan="6" class="text-center text-muted">Nenhum usuário encontrado.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
 
