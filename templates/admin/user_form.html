@@ -1,1 +1,66 @@
+{# templates/admin/user_form.html — v1.0.1 (12/08/2025) #}
+{% extends "base.html" %}
+
+{% block title %}Novo Usuário{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-3" style="max-width: 720px;">
+  <h4 class="mb-3">Criar novo usuário</h4>
+
+  {% if error %}
+    <div class="alert alert-danger py-2">{{ error }}</div>
+  {% endif %}
+
+  <form action="/admin/users/novo" method="post" class="needs-validation" novalidate>
+    <div class="mb-3">
+      <label class="form-label">Usuário</label>
+      <input type="text" name="username" class="form-control" required>
+      <div class="form-text">Nome de login. Ex.: joao.silva</div>
+    </div>
+
+    <div class="mb-3">
+      <label class="form-label">E-mail</label>
+      <input type="email" name="email" class="form-control" required>
+    </div>
+
+    <div class="row g-3">
+      <div class="col-md-6">
+        <label class="form-label">Senha</label>
+        <input type="password" name="password" class="form-control" minlength="6" required>
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">Confirmar senha</label>
+        <input type="password" name="password_confirm" class="form-control" minlength="6" required>
+      </div>
+    </div>
+
+    <div class="form-check mt-3">
+      <input class="form-check-input" type="checkbox" value="1" id="is_admin" name="is_admin">
+      <label class="form-check-label" for="is_admin">Conceder perfil de administrador</label>
+    </div>
+
+    <div class="d-flex gap-2 mt-4">
+      <button type="submit" class="btn btn-primary">Salvar</button>
+      <a href="/admin/users" class="btn btn-outline-secondary">Cancelar</a>
+    </div>
+  </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // Validação simples de confirmação de senha (client-side)
+  (function() {
+    const form = document.querySelector('form');
+    form.addEventListener('submit', function(e) {
+      const p1 = form.querySelector('input[name="password"]').value;
+      const p2 = form.querySelector('input[name="password_confirm"]').value;
+      if (p1 !== p2) {
+        e.preventDefault();
+        alert('As senhas não conferem.');
+      }
+    });
+  })();
+</script>
+{% endblock %}
 
