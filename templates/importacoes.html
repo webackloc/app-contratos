@@ -1,0 +1,189 @@
+{# =============================================================
+   templates/importacoes.html
+   Versão: v1.6.0 — 2025-08-26
+   - Render SSR com 'payload' injetado pela rota /importacoes
+   - Mantém contador e filtro client-side simples
+   ============================================================= #}
+{% extends "base.html" %}
+{% block title %}Importações{% endblock %}
+
+{% block content %}
+<h2 class="mb-3">📦 Importações</h2>
+
+{# ===== meta / badges ===== #}
+<div class="d-flex align-items-center gap-2 flex-wrap mb-2">
+  <h5 class="mb-0">Última importação</h5>
+  <a class="btn btn-outline-secondary btn-sm" href="/ultima-importacao/raw" target="_blank">Ver JSON</a>
+  <a class="btn btn-outline-primary btn-sm" href="/importacoes">Recarregar</a>
+
+  <span class="small text-muted ms-2">
+    {% if payload.disponivel %}
+      Arquivo: {{ payload.arquivo or payload.path|default('', true) }} • Atualizado em: {{ payload.updated_at or '—' }}
+    {% else %}
+      Arquivo não encontrado
+    {% endif %}
+  </span>
+
+  <div class="ms-auto d-flex align-items-center gap-2">
+    <span class="badge text-bg-secondary">origem: {{ payload.itens_origem or '—' }}</span>
+    <span class="badge text-bg-primary">itens: {{ payload.qtd_itens or payload.linhas_total or 0 }}</span>
+    <span class="badge text-bg-success">envios: {{ payload.inseridos or 0 }}</span>
+    <span class="badge text-bg-warning">retornos: {{ payload.retornos or 0 }}</span>
+    <span class="badge text-bg-info">trocas: {{ payload.trocas or 0 }}</span>
+  </div>
+</div>
+
+{# ===== filtro ===== #}
+<div class="d-flex align-items-center gap-2 mb-2" style="max-width:640px">
+  <span class="text-muted small">🔎</span>
+  <input id="filtro" type="text" class="form-control form-control-sm" placeholder="Filtrar... (cliente, contrato, item, serial, ativo)">
+  <span id="countInfo" class="small text-muted"></span>
+</div>
+
+{# ===== tabela ===== #}
+<div class="table-responsive">
+  <table class="table table-striped table-hover table-sm align-middle" id="tblLast">
+    <thead class="table-dark">
+      <tr>
+        <th>Status</th>
+        <th>Contrato</th>
+        <th>Item</th>
+        <th>Descrição</th>
+        <th>Serial</th>
+        <th>Cod. Pro</th>
+        <th>Data mov.</th>
+        <th>Tipo</th>
+        <th>Qtd</th>
+        <th>Valor mensal</th>
+        <th>Meses rest.</th>
+        <th>Cliente</th>
+        <th>Ativo</th>
+        <th>Cod. Cliente</th>
+        <th>Obs.</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if itens and itens|length > 0 %}
+        {% for it in itens %}
+          {# normaliza entrada #}
+          {% set _status = it.status or '' %}
+          {% set _contr  = it.contrato or '' %}
+          {% set _item   = it.item or '' %}
+          {% set _desc   = it.descricao or '' %}
+          {% set _serial = it.serial or '' %}
+          {% set _codpro = it.cod_pro or '' %}
+          {% set _dt     = it.data_mov or '' %}
+          {% set _tipo   = it.tipo or '' %}
+          {% set _qtd    = it.qtd or '' %}
+          {% set _vm     = it.valor_mensal or '' %}
+          {% set _meses  = it.meses_rest or '' %}
+          {% set _cli    = it.cliente or '' %}
+          {% set _ativo  = it.ativo or '' %}
+          {% set _codcli = it.cod_cliente or '' %}
+          {% set _obs    = it.obs or '' %}
+
+          {% set _find = (_status|string) ~ ' ' ~ (_contr|string) ~ ' ' ~ (_item|string) ~ ' ' ~
+                         (_desc|string) ~ ' ' ~ (_serial|string) ~ ' ' ~ (_codpro|string) ~ ' ' ~
+                         (_dt|string) ~ ' ' ~ (_tipo|string) ~ ' ' ~ (_qtd|string) ~ ' ' ~
+                         (_cli|string) ~ ' ' ~ (_ativo|string) ~ ' ' ~ (_codcli|string) ~ ' ' ~ (_obs|string) %}
+          <tr data-find="{{ _find|lower }}">
+            <td>{{ _status }}</td>
+            <td>{{ _contr }}</td>
+            <td style="font-family:monospace">{{ _item }}</td>
+            <td>{{ _desc }}</td>
+            <td>{{ _serial }}</td>
+            <td>{{ _codpro }}</td>
+            <td>{{ _dt }}</td>
+            <td>{{ _tipo }}</td>
+            <td>{{ _qtd }}</td>
+            <td>
+              {% if _vm not in ('', None) %}
+                {{ _vm|float|round(2) }}
+              {% endif %}
+            </td>
+            <td>{{ _meses }}</td>
+            <td>{{ _cli }}</td>
+            <td>{{ _ativo }}</td>
+            <td>{{ _codcli }}</td>
+            <td>{{ _obs }}</td>
+          </tr>
+        {% endfor %}
+      {% else %}
+        <tr><td colspan="15" class="text-center text-muted">Nenhum item encontrado.</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+</div>
+
+{# ===== histórico client-side opcional (mantido) ===== #}
+<div class="card shadow-sm mt-4">
+  <div class="card-body">
+    <h5 class="card-title mb-3">Últimas importações</h5>
+    <div id="histPlaceholder" class="text-muted">Carregando histórico…</div>
+  </div>
+</div>
+
+<script>
+(function(){
+  // filtro simples
+  const $tbody = document.querySelector('#tblLast tbody');
+  const $filter = document.getElementById('filtro');
+  const $count = document.getElementById('countInfo');
+
+  function applyFilter(){
+    const f = ($filter.value || '').toLowerCase().trim();
+    const trs = Array.from($tbody.querySelectorAll('tr'));
+    let vis=0, tot=trs.length;
+    trs.forEach(tr=>{
+      const ok = f === '' || (tr.getAttribute('data-find') || '').includes(f);
+      tr.style.display = ok ? '' : 'none';
+      if (ok) vis++;
+    });
+    $count.textContent = `${vis} de ${tot} item(ns)`;
+  }
+  $filter.addEventListener('input', applyFilter);
+  applyFilter();
+
+  // histórico (opcional)
+  const $hist = document.getElementById('histPlaceholder');
+  if ($hist) {
+    fetch('/ultima-importacao/historico?limit=200')
+      .then(r => r.ok ? r.json() : Promise.reject('HTTP '+r.status))
+      .then(data => {
+        const itens = data.itens || [];
+        if (!itens.length) { $hist.textContent = 'Sem histórico até o momento.'; return; }
+        const rows = itens.map(r => `
+          <tr>
+            <td>${r.timestamp ?? ''}</td>
+            <td>${r.arquivo ?? ''}</td>
+            <td>${r.linhas_total ?? ''}</td>
+            <td>${r.inseridos ?? ''}</td>
+            <td>${r.atualizados ?? ''}</td>
+            <td>${r.trocas ?? ''}</td>
+            <td>${r.retornos ?? ''}</td>
+            <td>${r.erros ?? ''}</td>
+          </tr>`).join('');
+        $hist.outerHTML = `
+          <div class="table-responsive">
+            <table class="table table-sm align-middle">
+              <thead>
+                <tr>
+                  <th>Quando (UTC)</th>
+                  <th>Arquivo</th>
+                  <th>Linhas</th>
+                  <th>Inseridos</th>
+                  <th>Atualizados</th>
+                  <th>Trocas</th>
+                  <th>Retornos</th>
+                  <th>Erros</th>
+                </tr>
+              </thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>`;
+      })
+      .catch(err => { $hist.textContent = 'Erro ao carregar histórico: ' + err; });
+  }
+})();
+</script>
+{% endblock %}

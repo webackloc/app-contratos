@@ -1,68 +1,124 @@
 {# =========================================================================
    templates/cadastrar.html
-   Versão: v1.3.3 - 2025-08-12
+   Versão: v1.6.0 - 2025-08-26
    CHANGELOG:
-     - [+] Coluna "Ações" na tabela e botão "Editar" por linha.
-     - [*] Remove trechos soltos de <th>/<td> fora da tabela.
-     - [*] Mantém compatibilidade contrato_n/contrato_num.
+     - [ui] Paleta roxa clara aplicada (consistente com contratos.html).
+     - [ui] Tabela com zebra/hover suaves; cartões de seção com fundo lilás.
+     - [=] Mantém campos, filtros, máscaras e links existentes.
    ========================================================================= #}
 {% extends "base.html" %}
 {% block title %}Cadastrar Contrato{% endblock %}
 
 {% block content %}
-<h2>📝 Cadastrar Novo Contrato</h2>
 
-{# Alertas de sucesso/erro #}
-{% if request.query_params.get('ok') == '1' and request.query_params.get('edit') == '1' %}
-  <div class="alert alert-success alert-dismissible fade show" role="alert">
-    Cabeçalho editado com sucesso.
-    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-  </div>
-{% endif %}
-{% if erro %}
-  <div class="alert alert-danger">{{ erro }}</div>
-{% endif %}
+<style>
+  :root{
+    --weback-purple: #4b2b83;
+    --weback-purple-600: #5b36a0;
+    --weback-purple-50: #f3effa;   /* fundo clarinho */
+    --weback-purple-25: #faf7ff;   /* zebra da tabela */
+  }
+  .section-card{
+    background: var(--weback-purple-50);
+    border: 1px solid rgba(75,43,131,.08);
+    border-radius: .75rem;
+    padding: 1rem 1rem 0.5rem;
+    box-shadow: 0 2px 8px rgba(75,43,131,.06);
+  }
+  .section-card h2, .section-card h4{
+    color: var(--weback-purple);
+    margin-top: .25rem;
+  }
+  .table-weback thead th{
+    background: var(--weback-purple);
+    color: #fff;
+    border-color: var(--weback-purple);
+  }
+  .table-weback tbody tr:nth-child(even){
+    background: var(--weback-purple-25);
+  }
+  .table-weback tbody tr:hover{
+    background: #efe8ff;
+  }
+  .btn-primary{
+    background-color: var(--weback-purple);
+    border-color: var(--weback-purple);
+  }
+  .btn-primary:hover{
+    background-color: var(--weback-purple-600);
+    border-color: var(--weback-purple-600);
+  }
+</style>
 
-<form method="post" action="/cadastrar" class="row g-3 mt-3">
+<div class="section-card mb-4">
+  <h2>📝 Cadastrar Novo Contrato</h2>
 
-  <div class="col-md-6">
-    <label for="nome_cliente" class="form-label">Nome do Cliente</label>
-    <input type="text" class="form-control" id="nome_cliente" name="nome_cliente" required>
-  </div>
+  {# Alertas de sucesso/erro (mantidos) #}
+  {% if request.query_params.get('ok') == '1' and request.query_params.get('edit') == '1' %}
+    <div class="alert alert-success alert-dismissible fade show" role="alert">
+      Cabeçalho editado com sucesso.
+      <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+  {% endif %}
+  {% if erro %}
+    <div class="alert alert-danger">{{ erro }}</div>
+  {% endif %}
 
-  <div class="col-md-6">
-    <label for="cnpj" class="form-label">CNPJ</label>
-    <input type="text" class="form-control" id="cnpj" name="cnpj" required>
-  </div>
+  <form method="post" action="/cadastrar" class="row g-3 mt-2">
+    <div class="col-md-6">
+      <label for="nome_cliente" class="form-label">Nome do Cliente</label>
+      <input type="text" class="form-control" id="nome_cliente" name="nome_cliente" required>
+    </div>
 
-  <div class="col-md-4">
-    <label for="contrato_num" class="form-label">Contrato Nº</label>
-    <input type="text" class="form-control" id="contrato_num" name="contrato_num" required>
-  </div>
+    <div class="col-md-6">
+      <label for="cnpj" class="form-label">CNPJ</label>
+      <input type="text" class="form-control" id="cnpj" name="cnpj" required>
+    </div>
 
-  <div class="col-md-4">
-    <label for="prazo_contratual" class="form-label">Prazo Contratual (meses)</label>
-    <input type="number" class="form-control" id="prazo_contratual" name="prazo_contratual" min="1" step="1" required>
-  </div>
+    {# ===== Campo: Cód. Cliente (cod_cli) ===== #}
+    <div class="col-md-4">
+      <label for="cod_cli" class="form-label">Cód. Cliente</label>
+      <input
+        type="text"
+        class="form-control"
+        id="cod_cli"
+        name="cod_cli"
+        placeholder="Ex.: 12345"
+        value="{{ request.query_params.get('cod_cli') or '' }}"
+        required
+      >
+      <div class="form-text">Código interno do cliente (alfanumérico permitido).</div>
+    </div>
 
-  <div class="col-md-4">
-    <label for="indice_reajuste" class="form-label">Índice de Reajuste (%)</label>
-    <input type="number" step="0.01" class="form-control" id="indice_reajuste" name="indice_reajuste" required>
-  </div>
+    <div class="col-md-4">
+      <label for="contrato_num" class="form-label">Contrato Nº</label>
+      <input type="text" class="form-control" id="contrato_num" name="contrato_num" required>
+    </div>
 
-  <div class="col-md-6">
-    <label for="vendedor" class="form-label">Vendedor</label>
-    <input type="text" class="form-control" id="vendedor" name="vendedor" required>
-  </div>
+    <div class="col-md-4">
+      <label for="prazo_contratual" class="form-label">Prazo Contratual (meses)</label>
+      <input type="number" class="form-control" id="prazo_contratual" name="prazo_contratual" min="1" step="1" required>
+    </div>
 
-  <div class="col-12 d-flex gap-2">
-    <button type="submit" class="btn btn-primary">Salvar Contrato</button>
-    <a href="/contratos_html" class="btn btn-outline-secondary">Ver Contratos</a>
-  </div>
-</form>
+    <div class="col-md-4">
+      <label for="indice_reajuste" class="form-label">Índice de Reajuste (%)</label>
+      <input type="number" step="0.01" class="form-control" id="indice_reajuste" name="indice_reajuste" required>
+    </div>
+
+    <div class="col-md-6">
+      <label for="vendedor" class="form-label">Vendedor</label>
+      <input type="text" class="form-control" id="vendedor" name="vendedor" required>
+    </div>
+
+    <div class="col-12 d-flex gap-2">
+      <button type="submit" class="btn btn-primary">Salvar Contrato</button>
+      <a href="/contratos_html" class="btn btn-outline-secondary">Ver Contratos</a>
+    </div>
+  </form>
+</div>
 
 <script>
-  // Máscara simples de CNPJ
+  // Máscara simples de CNPJ (mantida)
   document.getElementById("cnpj").addEventListener("input", function (e) {
     let value = e.target.value.replace(/\D/g, "");
     value = value.replace(/^(\d{2})(\d)/, "$1.$2");
@@ -73,45 +129,116 @@
   });
 </script>
 
-<hr class="mt-5 mb-4">
-<h4>📋 Contratos Cadastrados</h4>
-<div class="table-responsive">
-  <table class="table table-striped table-hover align-middle">
-    <thead class="table-dark">
-      <tr>
-        <th>Cliente</th>
-        <th>CNPJ</th>
-        <th>Contrato Nº</th>
-        <th>Prazo</th>
-        <th>Índice</th>
-        <th>Vendedor</th>
-        <th class="text-nowrap">Ações</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% if contratos and contratos|length > 0 %}
-        {% for contrato in contratos %}
-          <tr>
-            <td>{{ contrato.nome_cliente or contrato.nome_cli }}</td>
-            <td>{{ contrato.cnpj }}</td>
-            <td>{{ contrato.contrato_n or contrato.contrato_num }}</td>
-            <td>{{ contrato.prazo_contratual if contrato.prazo_contratual is not none else contrato.periodo_contratual }}</td>
-            <td>{{ contrato.indice_reajuste }}</td>
-            <td>{{ contrato.vendedor }}</td>
-            <td class="text-nowrap">
-              <a class="btn btn-sm btn-outline-secondary"
-                 href="/contratos/cabecalhos/{{ contrato.id }}/editar?next={{ request.url.path }}">
-                 Editar
-              </a>
-            </td>
-          </tr>
-        {% endfor %}
-      {% else %}
+<div class="section-card">
+  <h4 class="mb-2">📋 Contratos Cadastrados</h4>
+
+  {# ---- Barra de busca (client-side) ---- #}
+  <div class="row g-2 align-items-end mb-2">
+    <div class="col-md-4">
+      <label class="form-label mb-1" for="filterNome">Pesquisar por Nome do Cliente</label>
+      <input id="filterNome" type="text" class="form-control" placeholder="Ex.: ACME, João...">
+    </div>
+    <div class="col-md-4">
+      <label class="form-label mb-1" for="filterContrato">Pesquisar por Contrato Nº</label>
+      <input id="filterContrato" type="text" class="form-control" placeholder="Ex.: 2024-001">
+    </div>
+    <div class="col-md-4">
+      <label class="form-label mb-1" for="filterCodcli">Pesquisar por Cód. Cliente</label>
+      <input id="filterCodcli" type="text" class="form-control" placeholder="Ex.: 12345">
+    </div>
+    <div class="col-12 d-flex gap-2 mt-1">
+      <button id="btnLimparFiltros" type="button" class="btn btn-outline-secondary btn-sm">Limpar filtros</button>
+      <span id="countInfo" class="ms-auto text-muted small"></span>
+    </div>
+  </div>
+
+  <div class="table-responsive">
+    <table class="table table-striped table-hover align-middle table-weback" id="tabelaContratos">
+      <thead class="table-dark">
         <tr>
-          <td colspan="7" class="text-center text-muted">Nenhum cabeçalho cadastrado ainda.</td>
+          <th>Cliente</th>
+          <th>Cód. Cliente</th>
+          <th>CNPJ</th>
+          <th>Contrato Nº</th>
+          <th>Prazo</th>
+          <th>Índice</th>
+          <th>Vendedor</th>
+          <th class="text-nowrap">Ações</th>
         </tr>
-      {% endif %}
-    </tbody>
-  </table>
+      </thead>
+      <tbody>
+        {% if contratos and contratos|length > 0 %}
+          {% for contrato in contratos %}
+            {% set _nome = (contrato.nome_cliente or contrato.nome_cli) %}
+            {% set _contr = (contrato.contrato_n or contrato.contrato_num) %}
+            <tr
+              data-nome="{{ (_nome or '')|lower }}"
+              data-contrato="{{ (_contr or '')|lower }}"
+              data-codcli="{{ (contrato.cod_cli or '')|lower }}"
+            >
+              <td>{{ _nome }}</td>
+              <td>{{ contrato.cod_cli }}</td>
+              <td>{{ contrato.cnpj }}</td>
+              <td>{{ _contr }}</td>
+              <td>{{ contrato.prazo_contratual if contrato.prazo_contratual is not none else contrato.periodo_contratual }}</td>
+              <td>{{ contrato.indice_reajuste }}</td>
+              <td>{{ contrato.vendedor }}</td>
+              <td class="text-nowrap">
+                <a class="btn btn-sm btn-outline-secondary"
+                   href="/contratos/cabecalhos/{{ contrato.id }}/editar?next={{ request.url.path }}">
+                   Editar
+                </a>
+              </td>
+            </tr>
+          {% endfor %}
+        {% else %}
+          <tr>
+            <td colspan="8" class="text-center text-muted">Nenhum cabeçalho cadastrado ainda.</td>
+          </tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
 </div>
+
+<script>
+(function(){
+  const $nome = document.getElementById('filterNome');
+  const $contr = document.getElementById('filterContrato');
+  const $cod   = document.getElementById('filterCodcli');
+  const $btn   = document.getElementById('btnLimparFiltros');
+  const $info  = document.getElementById('countInfo');
+  const $tbody = document.querySelector('#tabelaContratos tbody');
+
+  function normalize(s){ return (s || '').toString().trim().toLowerCase(); }
+
+  function applyFilters(){
+    const fNome = normalize($nome.value);
+    const fCont = normalize($contr.value);
+    const fCod  = normalize($cod.value);
+
+    let total = 0, visiveis = 0;
+    $tbody.querySelectorAll('tr').forEach(tr => {
+      total++;
+      const n  = tr.getAttribute('data-nome') || '';
+      const c  = tr.getAttribute('data-contrato') || '';
+      const cc = tr.getAttribute('data-codcli') || '';
+      const ok =
+        (fNome === '' || n.includes(fNome)) &&
+        (fCont === '' || c.includes(fCont)) &&
+        (fCod  === '' || cc.includes(fCod));
+      tr.style.display = ok ? '' : 'none';
+      if (ok) visiveis++;
+    });
+    $info.textContent = visiveis + ' de ' + total + ' contrato(s) exibidos';
+  }
+
+  [$nome, $contr, $cod].forEach(inp => inp.addEventListener('input', applyFilters));
+  $btn.addEventListener('click', () => { $nome.value=''; $contr.value=''; $cod.value=''; applyFilters(); });
+
+  // inicial
+  applyFilters();
+})();
+</script>
+
 {% endblock %}

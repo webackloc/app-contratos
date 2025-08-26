@@ -1,14 +1,13 @@
-{# 
+{#
   =======================================================================================
   Projeto: Sistema de Gestão de Contratos
   Arquivo: templates/dashboard.html
-  Versão: v2.0 - 2025-08-11
-  Alterações:
-    • "Quantidade de Itens por Cliente" (Top 10) — backend já limita.
-    • Removido "Distribuição por Meses Restantes".
-    • Novo gráfico: "📅 Valores Mensais a Vencer por Trimestre"
-      (1º 0–3, 2º 4–6, 3º 7–9, 4º 10–12 e "Restante > 12m").
-  Base: v1.9.1 enviada anteriormente.
+  Versão: v2.4 - 2025-08-25
+  Alterações (v2.4):
+    • Removido o card "Valor Global Total" do template (não exibimos mais).
+    • Mantidos todos os cálculos no backend; nenhuma dependência visual do valor global.
+    • Limpeza: removida variável JS não utilizada referente ao valor global.
+  Base anterior: v2.3 - 2025-08-25 (com fallbacks de endpoints e KPIs novos)
   =======================================================================================
 #}
 
@@ -25,7 +24,7 @@
   <div class="col-12 col-md-4">
     <label for="f-cliente" class="form-label">Cliente (contém)</label>
     <input type="text" id="f-cliente" class="form-control" placeholder="Ex.: ACME" autocomplete="off">
-    <div id="sugestoes" class="list-group shadow position-absolute w-100" 
+    <div id="sugestoes" class="list-group shadow position-absolute w-100"
          style="z-index:1050; display:none; max-height:260px; overflow:auto;"></div>
   </div>
   <div class="col-6 col-md-3">
@@ -43,8 +42,9 @@
 
 <div id="resumo"></div>
 
+<!-- KPIs principais (3 cards: Total, Valor Mensal, Backlog) -->
 <div class="row mt-3">
-  <div class="col-md-3">
+  <div class="col-md-4">
     <div class="card text-bg-primary mb-3">
       <div class="card-body">
         <h5 class="card-title">Total de Contratos</h5>
@@ -56,7 +56,7 @@
       </div>
     </div>
   </div>
-  <div class="col-md-3">
+  <div class="col-md-4">
     <div class="card text-bg-success mb-3">
       <div class="card-body">
         <h5 class="card-title">Valor Mensal Total</h5>
@@ -64,19 +64,83 @@
       </div>
     </div>
   </div>
-  <div class="col-md-3">
-    <div class="card text-bg-warning mb-3">
+  <div class="col-md-4">
+    <div class="card text-bg-info mb-3">
       <div class="card-body">
-        <h5 class="card-title">Valor Global Total</h5>
-        <p class="card-text fs-4 fw-bold"><span id="valorGlobal">...</span></p>
+        <h5 class="card-title">Backlog Total</h5>
+        <p class="card-text fs-4 fw-bold"><span id="valorBacklog">...</span></p>
       </div>
     </div>
   </div>
-  <div class="col-md-3">
-    <div class="card text-bg-info mb-3">
+</div>
+
+<!-- KPIs adicionais: mês atual e vencidos -->
+<div class="row">
+  <div class="col-md-4">
+    <div class="card border-0 shadow-sm mb-3">
       <div class="card-body">
-        <h5 class="card-title">Valor Presente Total</h5>
-        <p class="card-text fs-4 fw-bold"><span id="valorPresente">...</span></p>
+        <h6 class="card-title mb-2">Itens devolvidos no mês</h6>
+        <div class="d-flex align-items-center gap-4">
+          <div>
+            <div class="text-muted" style="font-size:.85rem">Quantidade</div>
+            <div class="fs-4 fw-semibold" id="retMesQtd">—</div>
+          </div>
+          <div>
+            <div class="text-muted" style="font-size:.85rem">Valor mensal</div>
+            <div class="fs-4 fw-semibold" id="retMesValor">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card border-0 shadow-sm mb-3">
+      <div class="card-body">
+        <h6 class="card-title mb-2">Itens entregues no mês</h6>
+        <div class="d-flex align-items-center gap-4">
+          <div>
+            <div class="text-muted" style="font-size:.85rem">Quantidade</div>
+            <div class="fs-4 fw-semibold" id="envMesQtd">—</div>
+          </div>
+          <div>
+            <div class="text-muted" style="font-size:.85rem">Valor mensal</div>
+            <div class="fs-4 fw-semibold" id="envMesValor">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card border-0 shadow-sm mb-3">
+      <div class="card-body">
+        <h6 class="card-title mb-2">Contratos vencidos</h6>
+        <div class="d-flex align-items-center gap-4">
+          <div>
+            <div class="text-muted" style="font-size:.85rem">Quantidade</div>
+            <div class="fs-4 fw-semibold" id="vencQtd">—</div>
+          </div>
+          <div>
+            <div class="text-muted" style="font-size:.85rem">Valor mensal</div>
+            <div class="fs-4 fw-semibold" id="vencValor">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Card Última importação -->
+<div class="row">
+  <div class="col-md-4">
+    <div id="card-ultima" class="card shadow-sm border-0 mb-3">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <h5 class="card-title mb-0">Última importação</h5>
+          <span class="badge bg-info">Movimentação</span>
+        </div>
+        <div id="ultima-content">
+          <p class="text-muted mb-0">Carregando…</p>
+        </div>
       </div>
     </div>
   </div>
@@ -100,7 +164,7 @@
   </div>
 
   <div class="col-md-6">
-    <h5>💰 Valor Presente por Cliente (Top 10)</h5>
+    <h5>💰 Backlog por Cliente (Top 10)</h5>
     <div class="ratio ratio-16x9">
       <canvas id="graficoValorPorCliente"></canvas>
     </div>
@@ -117,7 +181,13 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>
 (function(){
-  const API = { DASH: "/api/dashboard/", CLIENTES: "/api/dashboard/clientes" };
+  // Endpoints com fallback (mantidos)
+  const ENDPOINTS = {
+    DASH: ["/dashboard", "/api/dashboard", "/api/dashboard/"],
+    CLIENTES: ["/dashboard/clientes", "/api/dashboard/clientes"],
+    ULTIMA: ["/dashboard/ultima_importacao", "/api/ultima_importacao", "/ultima-importacao", "/ultima_importacao"]
+  };
+
   const fmtMoney = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL", maximumFractionDigits: 2 });
   const fmtInt = new Intl.NumberFormat("pt-BR");
 
@@ -125,10 +195,19 @@
   const elTotalComItens = document.getElementById("totalContratosComItens");
   const elTotalItens = document.getElementById("totalItensContrato");
   const elMensal = document.getElementById("valorMensal");
-  const elGlobal = document.getElementById("valorGlobal");
-  const elPresente = document.getElementById("valorPresente");
+  const elBacklog = document.getElementById("valorBacklog");
   const elResumo = document.getElementById("resumo");
   const chips = document.getElementById("chips-filtros");
+
+  // KPIs adicionais
+  const elRetQtd = document.getElementById("retMesQtd");
+  const elRetVal = document.getElementById("retMesValor");
+  const elEnvQtd = document.getElementById("envMesQtd");
+  const elEnvVal = document.getElementById("envMesValor");
+  const elVencQtd = document.getElementById("vencQtd");
+  const elVencVal = document.getElementById("vencValor");
+
+  const elUltima = document.getElementById("ultima-content");
 
   const fForm = document.getElementById("form-filtros");
   const fCliente = document.getElementById("f-cliente");
@@ -139,30 +218,18 @@
   let chMesEnvio, chQtdCliente, chValorCliente, chTrimestres;
   let timer;
 
-  // ---- Autocomplete clientes ----
-  function debounce(fn, ms){ return function(...a){ clearTimeout(timer); timer = setTimeout(()=>fn.apply(this,a), ms); } }
-  async function carregarSugestoes(){
-    const q = fCliente.value.trim();
-    const url = q ? `${API.CLIENTES}?q=${encodeURIComponent(q)}&limit=20` : `${API.CLIENTES}?limit=20`;
-    const resp = await fetch(url);
-    if(!resp.ok) return (sug.style.display = "none");
-    const data = await resp.json();
-    sug.innerHTML = "";
-    (data.clientes || []).forEach(nome=>{
-      const a = document.createElement("button");
-      a.type = "button";
-      a.className = "list-group-item list-group-item-action";
-      a.textContent = nome || "N/D";
-      a.onclick = ()=>{ fCliente.value = nome || ""; sug.style.display = "none"; fForm.requestSubmit(); };
-      sug.appendChild(a);
-    });
-    sug.style.display = (data.clientes && data.clientes.length) ? "block" : "none";
+  // Utils -------------------------------------------------
+  async function fetchFirstOk(urls, opts) {
+    for (const u of urls) {
+      try {
+        const r = await fetch(u, opts);
+        if (r.ok) { return await r.json(); }
+        console.warn("endpoint falhou:", u, r.status);
+      } catch (e) { console.warn("erro em", u, e); }
+    }
+    throw new Error("Nenhum endpoint respondeu: " + urls.join(" | "));
   }
-  fCliente.addEventListener("focus", carregarSugestoes);
-  fCliente.addEventListener("input", debounce(carregarSugestoes, 200));
-  document.addEventListener("click", (e)=>{ if(!sug.contains(e.target) && e.target!==fCliente) sug.style.display="none"; });
-
-  // ---- Dashboard ----
+  function debounce(fn, ms){ return function(...a){ clearTimeout(timer); timer = setTimeout(()=>fn.apply(this,a), ms); } }
   function buildQuery(){
     const p = new URLSearchParams();
     if(fCliente.value.trim()) p.set("cliente", fCliente.value.trim());
@@ -183,26 +250,133 @@
       chips.append(span);
     });
   }
+  function setKpis(total, comItens, itens, mensal, backlog){
+    elTotal.textContent = total;
+    elTotalComItens.textContent = comItens;
+    elTotalItens.textContent = itens;
+    elMensal.textContent = mensal;
+    elBacklog.textContent = backlog;
+  }
+  function setExtras(retQtd, retVal, envQtd, envVal, vencQtd, vencVal){
+    elRetQtd.textContent = retQtd;
+    elRetVal.textContent = retVal;
+    elEnvQtd.textContent = envQtd;
+    elEnvVal.textContent = envVal;
+    elVencQtd.textContent = vencQtd;
+    elVencVal.textContent = vencVal;
+  }
+  function upsertChart(current, canvas, config){
+    if(!canvas) return null;
+    if(current){ current.data=config.data; current.options=config.options; current.update(); return current; }
+    return new Chart(canvas.getContext("2d"), config);
+  }
 
+  // Autocomplete -----------------------------------------
+  async function carregarSugestoes(){
+    const q = fCliente.value.trim();
+    const base = ENDPOINTS.CLIENTES[0];
+    const url = q ? `${base}?q=${encodeURIComponent(q)}&limit=20` : `${base}?limit=20`;
+    try{
+      const resp = await fetch(url);
+      if(!resp.ok) throw new Error("autocomplete falhou");
+      const data = await resp.json();
+      sug.innerHTML = "";
+      (data.clientes || []).forEach(nome=>{
+        const a = document.createElement("button");
+        a.type = "button";
+        a.className = "list-group-item list-group-item-action";
+        a.textContent = nome || "N/D";
+        a.onclick = ()=>{ fCliente.value = nome || ""; sug.style.display = "none"; fForm.requestSubmit(); };
+        sug.appendChild(a);
+      });
+      sug.style.display = (data.clientes && data.clientes.length) ? "block" : "none";
+    }catch{ sug.style.display = "none"; }
+  }
+  fCliente.addEventListener("focus", carregarSugestoes);
+  fCliente.addEventListener("input", debounce(carregarSugestoes, 200));
+  document.addEventListener("click", (e)=>{ if(!sug.contains(e.target) && e.target!==fCliente) sug.style.display="none"; });
+
+  // Última importação ------------------------------------
+  function renderUltima(data){
+    if(!data || data.exists === false){
+      elUltima.innerHTML = "<p class='text-muted mb-0'>Nenhuma importação registrada.</p>";
+      return;
+    }
+    const ts = data.timestamp || "-";
+    const ok = Number(data.ok || 0);
+    const erros = Number(data.erros || 0);
+    const lote = data.lote_id != null ? "#" + data.lote_id : "-";
+    const contratos = Array.isArray(data.contratos_afetados) ? data.contratos_afetados : [];
+
+    elUltima.innerHTML = `
+      <div class="mb-2">
+        <div class="text-muted" style="font-size:.9rem">Executada em</div>
+        <div><strong>${ts}</strong></div>
+      </div>
+      <div class="d-flex gap-3 my-2">
+        <div>
+          <div class="text-muted" style="font-size:.8rem">OK</div>
+          <div class="fs-4">${ok}</div>
+        </div>
+        <div>
+          <div class="text-muted" style="font-size:.8rem">Erros</div>
+          <div class="fs-4">${erros}</div>
+        </div>
+        <div>
+          <div class="text-muted" style="font-size:.8rem">Lote</div>
+          <div class="fs-4">${lote}</div>
+        </div>
+      </div>
+      ${contratos.length ? `
+        <div class="mt-2">
+          <div class="text-muted" style="font-size:.9rem">Contratos afetados</div>
+          <div class="d-flex flex-wrap gap-2 mt-1">
+            ${contratos.map(cab => `<span class="badge bg-light text-dark border">#${cab}</span>`).join("")}
+          </div>
+        </div>
+      ` : ""}
+    `;
+  }
+
+  async function carregarUltima(){
+    try {
+      elUltima.innerHTML = "<p class='text-muted mb-0'>Carregando…</p>";
+      const data = await fetchFirstOk(ENDPOINTS.ULTIMA, { headers: { "Accept": "application/json" } });
+      renderUltima(data);
+    } catch (e) {
+      elUltima.innerHTML = "<p class='text-danger mb-0'>Não foi possível carregar a última importação.</p>";
+      console.error(e);
+    }
+  }
+
+  // Dashboard -------------------------------------------
   async function carregarDashboard() {
     try {
       elResumo.innerHTML = "";
-      setKpis("...", "...", "...", "...", "...", "...");
+      setKpis("...", "...", "...", "...", "...");
+      setExtras("—","—","—","—","—","—");
+
       const qs = buildQuery();
-      const resp = await fetch(API.DASH + qs, { headers: {"Accept":"application/json"} });
-      if (!resp.ok) throw new Error("Falha ao buscar dados do dashboard ("+resp.status+")");
-      const d = await resp.json();
+      const urls = ENDPOINTS.DASH.map(u => u + qs);
+      const d = await fetchFirstOk(urls, { headers: {"Accept":"application/json"} });
 
       setKpis(
         fmtInt.format(d.total_contratos ?? 0),
         fmtInt.format(d.total_contratos_com_itens ?? 0),
         fmtInt.format(d.total_itens_contrato ?? 0),
         fmtMoney.format(d.valor_mensal_total ?? 0),
-        fmtMoney.format(d.valor_global_total ?? 0),
-        fmtMoney.format(d.valor_presente_total ?? 0),
+        fmtMoney.format((d.backlog_total ?? d.valor_presente_total ?? 0))
       );
 
-      // 1) Valor Mensal adicionado (12 meses fixos do backend)
+      setExtras(
+        fmtInt.format(d.devolvidos_mes_atual?.quantidade ?? 0),
+        fmtMoney.format(d.devolvidos_mes_atual?.valor_mensal ?? 0),
+        fmtInt.format(d.entregues_mes_atual?.quantidade ?? 0),
+        fmtMoney.format(d.entregues_mes_atual?.valor_mensal ?? 0),
+        fmtInt.format(d.contratos_vencidos?.quantidade ?? 0),
+        fmtMoney.format(d.contratos_vencidos?.valor_mensal ?? 0),
+      );
+
       const porMesLabels = (d.mensal_por_mes ?? []).map(x => x.mes);
       const porMesData   = (d.mensal_por_mes ?? []).map(x => x.valor ?? 0);
       chMesEnvio = upsertChart(
@@ -212,7 +386,6 @@
           options: { responsive:true, maintainAspectRatio:false, scales:{ y:{ ticks:{ callback:v=>fmtMoney.format(v) } } } } }
       );
 
-      // 2) Quantidade de Itens por Cliente (Top 10) — back já limita
       const qtdCliLabels = (d.qtd_por_cliente ?? []).map(x => x.cliente || "N/D");
       const qtdCliData   = (d.qtd_por_cliente ?? []).map(x => x.quantidade ?? 0);
       chQtdCliente = upsertChart(
@@ -222,22 +395,20 @@
           options: { responsive:true, maintainAspectRatio:false, indexAxis: qtdCliLabels.length>10 ? "y" : "x" } }
       );
 
-      // 3) Valor Presente por Cliente (Top 10)
-      const valRows = (d.valor_presente_por_cliente && d.valor_presente_por_cliente.length)
-                      ? d.valor_presente_por_cliente
-                      : (d.valor_global_por_cliente || []);
+      const valRows = (d.backlog_por_cliente && d.backlog_por_cliente.length)
+                      ? d.backlog_por_cliente
+                      : (d.valor_presente_por_cliente || []);
       const valCliLabels = valRows.map(x => x.cliente || "N/D");
       const valCliData   = valRows.map(x => x.valor ?? 0);
       chValorCliente = upsertChart(
         chValorCliente, document.getElementById("graficoValorPorCliente"),
         { type: "bar",
-          data: { labels: valCliLabels, datasets: [{ label: "Valor Presente (R$)", data: valCliData }] },
+          data: { labels: valCliLabels, datasets: [{ label: "Backlog (R$)", data: valCliData }] },
           options: { responsive:true, maintainAspectRatio:false,
                      indexAxis: valCliLabels.length>10 ? "y" : "x",
                      scales:{ y:{ ticks:{ callback:v=>fmtMoney.format(v) } } } } }
       );
 
-      // 4) NOVO: Valores Mensais a Vencer por Trimestre
       const triLabels = (d.vencimento_trimestres ?? []).map(x => x.bucket);
       const triData   = (d.vencimento_trimestres ?? []).map(x => x.valor ?? 0);
       chTrimestres = upsertChart(
@@ -249,23 +420,21 @@
       );
 
       renderChips();
-
     } catch (err) {
       console.error(err);
       elResumo.innerHTML = "<p class='text-danger'>Erro ao carregar os dados do dashboard.</p>";
-      setKpis("erro","erro","erro","erro","erro","erro");
+      setKpis("erro","erro","erro","erro","erro");
+      setExtras("—","—","—","—","—","—");
     }
   }
 
-  function setKpis(a,b,c,d,e,f){ elTotal.textContent=a; elTotalComItens.textContent=b; elTotalItens.textContent=c; elMensal.textContent=d; elGlobal.textContent=e; elPresente.textContent=f; }
-  function upsertChart(current, canvas, config){
-    if(!canvas) return null;
-    if(current){ current.data=config.data; current.options=config.options; current.update(); return current; }
-    return new Chart(canvas.getContext("2d"), config);
-  }
-
-  fForm.addEventListener("submit", function(e){ e.preventDefault(); carregarDashboard(); });
-  document.addEventListener("DOMContentLoaded", ()=>{ carregarDashboard(); renderChips(); });
+  // Eventos
+  document.getElementById("form-filtros").addEventListener("submit", function(e){ e.preventDefault(); carregarDashboard(); });
+  document.addEventListener("DOMContentLoaded", ()=>{
+    carregarDashboard();
+    carregarUltima();
+    renderChips();
+  });
 })();
 </script>
 {% endblock %}

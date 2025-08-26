@@ -1,33 +1,126 @@
+{# contratos.html — v2025.08.26.3
+   Alterações:
+   - Cabeçalho da tabela com roxo do tema (em vez de preto).
+   - Listras do corpo em roxo clarinho/branco (sem fundo preto).
+   - Mantidas: filtros, export, ordenação, paginação, badges/resumos, backlog, sticky header.
+#}
 {% extends "base.html" %}
-
 {% block title %}Lista de Contratos{% endblock %}
 
 {% block content %}
-<div class="d-flex justify-content-end align-items-center mb-3">
-  <form action="/contratos/sincronizar" method="post"
-        onsubmit="return confirm('Atualizar todos os contratos? Esta operação pode levar alguns segundos.');">
-    <button type="submit" class="btn btn-primary">Atualizar tudo</button>
+
+{# ===== Macros de formatação seguras (mantidas) ===== #}
+{% macro money(v) -%}
+  R$ {{ "{:,.2f}".format((v or 0.0)) }}
+{%- endmacro %}
+{% macro datebr(d) -%}
+  {{ d.strftime('%d/%m/%Y') if d else '' }}
+{%- endmacro %}
+
+<style>
+  :root{
+    --wb-brand: #5b2aa6;            /* roxo do topo/menu (mais escuro) */
+    --wb-row-alt: #f3e8ff;          /* roxo clarinho das listras */
+    --wb-row-hover: #ede9fe;        /* hover suave */
+    --wb-badge-bg: #ede9fe;         /* badges */
+    --wb-badge-fg: #3730a3;
+  }
+
+  /* rolagem fluida (evita “tela travada”) */
+  html, body { overflow-y: auto !important; }
+
+  /* cabeçalho fixo e largura estável da tabela */
+  .table-responsive { overflow-x: auto; }
+  table.table { table-layout: fixed; }
+  thead.wb-thead th { position: sticky; top: 0; z-index: 2; background: var(--wb-brand); color: #fff; }
+  thead.wb-thead th a { color: #fff; }
+
+  /* larguras por coluna (mantidas) */
+  th.col-id{width:64px}
+  th.col-ativo{width:120px}
+  th.col-serial{width:140px}
+  th.col-codprod{width:130px}
+  th.col-desc{width:240px}
+  th.col-codcli{width:120px}
+  th.col-nomecli{width:220px}
+  th.col-data{width:120px}
+  th.col-contrato{width:140px}
+  th.col-monet{width:130px}
+  th.col-int{width:120px}
+  th.col-acao{width:120px}
+  td.ellipsis, th.ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* Paleta da tabela (substitui listras padrão) */
+  table.table.wb {
+    --bs-table-striped-bg: var(--wb-row-alt);
+    --bs-table-striped-color: inherit;
+    --bs-table-hover-bg: var(--wb-row-hover);
+    --bs-table-hover-color: inherit;
+    --bs-table-bg: #ffffff;
+  }
+
+  /* barra de filtros/ações */
+  .filters .form-control{ height:38px }
+  .badge-soft {
+    display:inline-block; padding:.35rem .6rem; border-radius:999px;
+    background:var(--wb-badge-bg); color:var(--wb-badge-fg); font-weight:600; font-size:.85rem;
+  }
+</style>
+
+<div class="d-flex justify-content-between align-items-end gap-2 flex-wrap mb-3">
+  <!-- Filtros -->
+  <form class="filters d-flex align-items-end gap-2 flex-wrap" method="get" action="/contratos">
+    <div>
+      <label class="form-label mb-1">Cliente (contém)</label>
+      <input type="text" name="cliente" value="{{ cliente or '' }}" class="form-control" placeholder="Ex.: ACME">
+    </div>
+    <div>
+      <label class="form-label mb-1">Contrato Nº</label>
+      <input type="text" name="contrato" value="{{ contrato or '' }}" class="form-control" placeholder="Ex.: 2023-001">
+    </div>
+    <div>
+      <label class="form-label mb-1">Ativo</label>
+      <input type="text" name="ativo" value="{{ ativo or '' }}" class="form-control" placeholder="Ex.: NB-1234">
+    </div>
+    <div class="form-check mb-2 ms-2">
+      <input class="form-check-input" type="checkbox" id="chkRet" name="incluir_retornados" value="true" {% if incluir_retornados %}checked{% endif %}>
+      <label class="form-check-label" for="chkRet">Incluir retornados</label>
+    </div>
+
+    <input type="hidden" name="order_by" value="{{ order_by }}">
+    <input type="hidden" name="order_dir" value="{{ order_dir }}">
+    <input type="hidden" name="per_page" value="{{ per_page }}">
+    <input type="hidden" name="page" value="1">
+
+    <button type="submit" class="btn btn-primary">Aplicar</button>
+    <a href="/contratos" class="btn btn-outline-secondary">Limpar</a>
   </form>
+
+  <!-- Ações (export e atualizar tudo) -->
+  {% set qs_base = 'cliente=' ~ (cliente|urlencode) ~
+                   '&contrato=' ~ (contrato|urlencode) ~
+                   '&ativo=' ~ (ativo|urlencode) ~
+                   '&incluir_retornados=' ~ ('true' if incluir_retornados else 'false') ~
+                   '&order_by=' ~ (order_by or '') ~
+                   '&order_dir=' ~ (order_dir or '') %}
+
+  <div class="d-flex gap-2">
+    <a class="btn btn-outline-secondary" target="_blank" href="/contratos/export?fmt=csv&{{ qs_base }}">Exportar CSV</a>
+    <a class="btn btn-outline-secondary" target="_blank" href="/contratos/export?fmt=xlsx&{{ qs_base }}">Exportar XLSX</a>
+
+    <form action="/contratos/sincronizar" method="post"
+          onsubmit="return confirm('Atualizar todos os contratos? Esta operação pode levar alguns segundos.');">
+      <button type="submit" class="btn btn-primary">Atualizar tudo</button>
+    </form>
+  </div>
 </div>
 
+{# alertas do modo "lote" (mantidos) #}
 {% if request.query_params.get('ok') == '1' %}
   <div class="alert alert-success alert-dismissible fade show" role="alert">
     Atualização em lote concluída — atualizados: {{ request.query_params.get('n','0') }},
-    sem cabeçalho: {{ request.query_params.get('skip','0') }}, erros: {{ request.query_params.get('err','0') }}.
-    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-  </div>
-{% endif %}
-
-<div class="d-flex justify-content-end align-items-center mb-3">
-  <!-- Botão global opcional: para um endpoint de sincronização em lote (se você criar) -->
-  <!-- <form action="/contratos/sincronizar" method="post">
-    <button type="submit" class="btn btn-primary">Atualizar TODOS os itens</button>
-  </form> -->
-</div>
-
-{% if request.query_params.get('ok') == '1' %}
-  <div class="alert alert-success alert-dismissible fade show" role="alert">
-    Itens atualizados com sucesso! ({{ request.query_params.get('n', '0') }} item(ns))
+    sem cabeçalho: {{ request.query_params.get('skip_sem_cab','0') }}, retornados ignorados: {{ request.query_params.get('skip_ret','0') }},
+    erros: {{ request.query_params.get('err','0') }}.
     <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
   </div>
 {% elif request.query_params.get('msg') == 'sem_itens' %}
@@ -37,57 +130,115 @@
   </div>
 {% endif %}
 
-<h2>📄 Lista de Contratos</h2>
+{% if usando_retornados %}
+  <div class="alert alert-warning py-2">
+    Nenhum item “em carteira”. Mostrando com <strong>retornados incluídos</strong>.
+  </div>
+{% endif %}
+
+<h2 class="mb-2">📄 Lista de Contratos</h2>
+
+<div class="mb-2 d-flex gap-2 flex-wrap">
+  <span class="badge-soft">Total: {{ total }}</span>
+  <span class="badge-soft">Valor Mensal: {{ money(valor_mensal_sum) }}</span>
+  <span class="badge-soft">Backlog: {{ money(backlog_sum) }}</span>
+</div>
+
+{# ==== Cabeçalho com ordenação ==== #}
+{% set flip = 'asc' if (order_dir == 'desc') else 'desc' %}
+{% macro head(label, col, klass) -%}
+  {% set dir = flip if (order_by == col) else 'desc' %}
+  <th class="{{ klass }} ellipsis">
+    <a class="link-light text-decoration-none"
+       href="/contratos?{{ qs_base }}&per_page={{ per_page }}&page=1&order_by={{ col }}&order_dir={{ dir }}">
+      {{ label }}{% if order_by == col %} {{ '▲' if order_dir=='asc' else '▼' }}{% endif %}
+    </a>
+  </th>
+{%- endmacro %}
 
 <div class="table-responsive mt-3">
-  <table class="table table-bordered table-striped table-hover table-sm">
-    <thead class="table-dark">
+  <table class="table table-bordered table-hover table-sm table-striped wb align-middle">
+    <thead class="wb-thead">
       <tr>
-        <th>ID</th>
-        <th>Ativo</th>
-        <th>Serial</th>
-        <th>Código Produto</th>
-        <th>Descrição</th>
-        <th>Cód. Cliente</th>
-        <th>Nome Cliente</th>
-        <th>Data Envio</th>
-        <th>Contrato Nº</th>
-        <th>Valor Mensal</th>
-        <th>Período Contratual</th>
-        <th>Meses Restantes</th>
-        <th>Valor Global</th>
-        <th>Valor Presente</th>
-        <th>Ações</th>
+        {{ head('ID','id','col-id') }}
+        {{ head('Ativo','ativo','col-ativo') }}
+        {{ head('Serial','serial','col-serial') }}
+        {{ head('Código Produto','cod_pro','col-codprod') }}
+        {{ head('Descrição','descricao_produto','col-desc') }}
+        {{ head('Cód. Cliente','cod_cli','col-codcli') }}
+        {{ head('Nome Cliente','nome_cli','col-nomecli') }}
+        {{ head('Data Envio','data_envio','col-data') }}
+        {{ head('Contrato Nº','contrato_num','col-contrato') }}
+        {{ head('Valor Mensal','valor_mensal','col-monet') }}
+        {{ head('Período Contratual','periodo_contratual','col-int') }}
+        {{ head('Meses Restantes','meses_restantes','col-int') }}
+        {{ head('Valor Global','valor_global_contrato','col-monet') }}
+        {{ head('BackLog','backlog','col-monet') }}
+        <th class="col-acao text-center">Ações</th>
       </tr>
     </thead>
     <tbody>
-      {% for c in contratos %}
-      <tr>
-        <td>{{ c.id }}</td>
-        <td>{{ c.ativo }}</td>
-        <td>{{ c.serial }}</td>
-        <td>{{ c.cod_pro }}</td>
-        <td>{{ c.descricao_produto }}</td>
-        <td>{{ c.cod_cli }}</td>
-        <td>{{ c.nome_cli }}</td>
-        <td>{{ c.data_envio.strftime('%d/%m/%Y') if c.data_envio else '' }}</td>
-        <td>{{ c.contrato_n }}</td>
-        <td>R$ {{ "{:,.2f}".format(c.valor_mensal) }}</td>
-        <td>{{ c.periodo_contratual }}</td>
-        <td>{{ c.meses_restantes }}</td>
-        <td>R$ {{ "{:,.2f}".format(c.valor_global_contrato) }}</td>
-        <td>R$ {{ "{:,.2f}".format(c.valor_presente_contrato) }}</td>
-        <td>
-          <form action="/contratos/sincronizar/{{ c.contrato_n }}" method="post" class="d-inline"
-                onsubmit="return confirm('Sincronizar período e recalcular os itens do contrato {{ c.contrato_n }}?');">
-            <button type="submit" class="btn btn-sm btn-outline-primary">
-              Atualizar
-            </button>
-          </form>
-        </td>
-      </tr>
+      {# usa a chave que seu back-end antigo já esperava #}
+      {% set lista = contratos if contratos is defined else rows %}
+      {% for c in lista %}
+        {% set contrato_num = c.contrato_num or c.contrato_n or c.numero or c.numero_contrato %}
+        {% set vm = (c.valor_mensal or 0.0) %}
+        {% set mr = (c.meses_restantes or 0) %}
+        {% set backlog = (vm * mr) %}
+        <tr>
+          <td class="ellipsis text-center" title="{{ c.id }}">{{ c.id }}</td>
+          <td class="ellipsis" title="{{ c.ativo }}">{{ c.ativo }}</td>
+          <td class="ellipsis" title="{{ c.serial }}">{{ c.serial or '' }}</td>
+          <td class="ellipsis" title="{{ c.cod_pro }}">{{ c.cod_pro or '' }}</td>
+          <td class="ellipsis" title="{{ c.descricao_produto }}">{{ c.descricao_produto or '' }}</td>
+          <td class="ellipsis text-center" title="{{ c.cod_cli }}">{{ c.cod_cli or '' }}</td>
+          <td class="ellipsis" title="{{ c.nome_cli }}">{{ c.nome_cli or '' }}</td>
+          <td class="ellipsis text-center" title="{{ c.data_envio }}">{{ datebr(c.data_envio) }}</td>
+          <td class="ellipsis text-center" title="{{ contrato_num }}">{{ contrato_num or '' }}</td>
+          <td class="ellipsis text-end" title="{{ vm }}">{{ money(vm) }}</td>
+          <td class="ellipsis text-center" title="{{ c.periodo_contratual }}">{{ c.periodo_contratual or '' }}</td>
+          <td class="ellipsis text-center" title="{{ mr }}">{{ mr }}</td>
+          <td class="ellipsis text-end" title="{{ c.valor_global_contrato }}">{{ money(c.valor_global_contrato or 0) }}</td>
+          <td class="ellipsis text-end" title="{{ backlog }}">{{ money(backlog) }}</td>
+          <td class="text-center">
+            {% if contrato_num %}
+              <form action="/contratos/sincronizar/{{ contrato_num }}" method="post" class="d-inline"
+                    onsubmit="return confirm('Sincronizar e recalcular o contrato {{ contrato_num }}?');">
+                <button type="submit" class="btn btn-sm btn-outline-primary">Atualizar</button>
+              </form>
+            {% else %}
+              <button type="button" class="btn btn-sm btn-outline-secondary" disabled
+                      title="Este item não possui número de contrato disponível">
+                Atualizar
+              </button>
+            {% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="15" class="text-center py-3">Nenhum registro encontrado.</td></tr>
       {% endfor %}
     </tbody>
   </table>
 </div>
+
+{# ===== Paginação ===== #}
+{% set total_pages = (total // per_page) + (1 if (total % per_page) else 0) %}
+{% set base = '/contratos?' ~ qs_base ~ '&order_by=' ~ (order_by or '') ~ '&order_dir=' ~ (order_dir or '') %}
+<div class="d-flex justify-content-between align-items-center mt-2 flex-wrap gap-2">
+  <div class="btn-group" role="group" aria-label="Paginação">
+    <a class="btn btn-outline-secondary" href="{{ base }}&per_page={{ per_page }}&page=1">« Primeiro</a>
+    <a class="btn btn-outline-secondary" href="{{ base }}&per_page={{ per_page }}&page={{ page-1 if page>1 else 1 }}">‹ Anterior</a>
+    <span class="btn btn-outline-secondary disabled">Página {{ page }} / {{ total_pages if total_pages>0 else 1 }}</span>
+    <a class="btn btn-outline-secondary" href="{{ base }}&per_page={{ per_page }}&page={{ page+1 if page<total_pages else total_pages }}">Próximo ›</a>
+    <a class="btn btn-outline-secondary" href="{{ base }}&per_page={{ per_page }}&page={{ total_pages if total_pages>0 else 1 }}">Último »</a>
+  </div>
+  <div class="btn-group" role="group" aria-label="Itens por página">
+    <span class="btn btn-outline-secondary disabled">Itens por página</span>
+    {% for n in [25,50,100,200] %}
+      <a class="btn {% if per_page==n %}btn-primary{% else %}btn-outline-secondary{% endif %}"
+         href="{{ base }}&per_page={{ n }}&page=1">{{ n }}</a>
+    {% endfor %}
+  </div>
+</div>
+
 {% endblock %}

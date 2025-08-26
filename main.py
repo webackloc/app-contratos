@@ -1,4 +1,9 @@
-# main.py – Versão 3.9.17 (2025-08-11) — inclui admin_users e ajustes mínimos sem quebrar o que já funciona
+# main.py – Versão 3.11.0 (2025-08-26)
+# - Inclui também routers de página da "Última Importação" (/importacoes)
+# - Evita conflito da rota antiga /ultima_importacao (renomeada p/ /ultima_importacao_legacy -> redirect)
+# - Adiciona /_routes para diagnóstico rápido
+# - Mantém todo o comportamento anterior
+
 import os
 import csv
 import io
@@ -8,7 +13,7 @@ from uuid import uuid4
 from datetime import datetime, date
 from typing import Optional
 
-from fastapi import FastAPI, Request, Depends, UploadFile, File, Form, Body, HTTPException
+from fastapi import FastAPI, Request, Depends, UploadFile, File, Form, Body, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -16,13 +21,20 @@ from jinja2 import TemplateNotFound
 
 from starlette.middleware.sessions import SessionMiddleware
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from utils.auth_middleware import AuthRequiredMiddleware
 
-from routers import admin_users as admin_users_router, contratos_sync, cabecalhos_edit, auth as auth_router
-
+from routers import (
+    admin_users as admin_users_router,
+    contratos_sync,
+    cabecalhos_edit,
+    auth as auth_router,
+    importar_movimentacao,
+    ultima_importacao,
+    aliases
+)
 
 # ── MODELOS ────────────────────────────────────────────────────────────────────
 try:
@@ -52,11 +64,6 @@ except Exception:
 
 # ── Routers opcionais ─────────────────────────────────────────────────────────
 try:
-    from routers import auth as auth_router
-except Exception:
-    auth_router = None
-
-try:
     from routers import dashboard
 except Exception:
     dashboard = None
@@ -73,7 +80,7 @@ except Exception:
     _HAS_DEBUG_AUTH = False
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(version="3.9.17")
+app = FastAPI(version="3.11.0")
 
 # diretórios/arquivos de runtime (logs/ultima importação)
 RUNTIME_DIR = os.getenv("RUNTIME_DIR", os.path.join(os.getcwd(), "runtime"))
@@ -124,9 +131,10 @@ print(
     "(esperado: ['SessionMiddleware', 'AuthRequiredMiddleware'])",
 )
 
-# Routers opcionais (só inclui se existirem)
+# ── Inclui routers ────────────────────────────────────────────────────────────
+# (inclui apenas uma vez cada router)
 if auth_router and hasattr(auth_router, "router"):
-    app.include_router(auth_router.router)
+    app.include_router(auth_router.router, tags=["auth"])
 if _HAS_DEBUG_AUTH and debug_auth_router and hasattr(debug_auth_router, "router"):
     app.include_router(debug_auth_router.router)
 if export_router and hasattr(export_router, "router"):
@@ -137,7 +145,23 @@ if dashboard and hasattr(dashboard, "router"):
 app.include_router(admin_users_router.router)
 app.include_router(contratos_sync.router, prefix="/contratos", tags=["contratos"])
 app.include_router(cabecalhos_edit.router, tags=["contratos"])
-app.include_router(auth_router.router, tags=["auth"])
+app.include_router(importar_movimentacao.router)
+
+# ----- Última Importação (API + Página) -----
+# API (prefixo /ultima-importacao) já existia no módulo
+app.include_router(ultima_importacao.router)
+# Página /importacoes e compat fornecidas pelo módulo (novo include)
+try:
+    if hasattr(ultima_importacao, "router_page"):
+        app.include_router(ultima_importacao.router_page)
+        ver = getattr(ultima_importacao, "__version__", "unknown")
+        print(f"[ultima_importacao] routers registrados (mod:{ver})")
+    else:
+        print("[ultima_importacao] router_page indisponível no módulo.")
+except Exception as e:
+    print("[ultima_importacao] falha ao registrar router_page:", e)
+
+app.include_router(aliases.router)
 
 # ── DB util ───────────────────────────────────────────────────────────────────
 def get_db():
@@ -204,10 +228,6 @@ def get_contract_field(model) -> Optional[str]:
 
 # ---- LOG helper (compatível com diferentes esquemas de ContratoLog) ----
 def add_contrato_log(db: Session, contrato_obj, acao: str, detalhes: dict):
-    """
-    Grava um log para o item de contrato (Contrato). Se o modelo ContratoLog
-    não existir no schema, apenas ignora com aviso.
-    """
     try:
         cols = set(ContratoLog.__table__.columns.keys())
     except Exception:
@@ -217,7 +237,6 @@ def add_contrato_log(db: Session, contrato_obj, acao: str, detalhes: dict):
     payload_json = json.dumps(detalhes, ensure_ascii=False, default=str)
     kwargs = {}
 
-    # coluna do vínculo
     vinc_id = getattr(contrato_obj, "id", None)
     if "contrato_id" in cols:
         kwargs["contrato_id"] = vinc_id
@@ -226,13 +245,11 @@ def add_contrato_log(db: Session, contrato_obj, acao: str, detalhes: dict):
     elif "contrato" in cols:
         kwargs["contrato"] = vinc_id
 
-    # ação
     if "acao" in cols:
         kwargs["acao"] = acao
     elif "action" in cols:
         kwargs["action"] = acao
 
-    # conteúdo
     if "detalhes" in cols:
         kwargs["detalhes"] = payload_json
     elif "mensagem" in cols:
@@ -420,6 +437,13 @@ def find_single_for_return(db: Session, it_field: str, contrato_numero: str, r: 
     unico, how = find_item_by_heuristics(db, it_field, contrato_numero, r)
     return unico, how
 
+# ── PARÂMETRO GLOBAL DE FILTRAGEM ────────────────────────────────────────────
+def _query_oculta_retornados(q, mostrar_retornados: bool):
+    if mostrar_retornados:
+        return q
+    # Oculta por padrão: status != 'RETORNADO' ou status IS NULL
+    return q.filter(or_(Contrato.status.is_(None), Contrato.status != "RETORNADO"))
+
 # ── ROTAS HTML ────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -431,18 +455,30 @@ async def dashboard_page(request: Request):
 
 # ── ENDPOINTS DE DADOS (dashboard simples) ───────────────────────────────────
 @app.get("/relatorio/carteira")
-def relatorio_carteira(db: Session = Depends(get_db)):
-    contratos = db.query(Contrato).all()
+def relatorio_carteira(
+    include_ret: int = Query(0, description="1 para incluir retornados"),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Contrato)
+    q = _query_oculta_retornados(q, mostrar_retornados=bool(include_ret))
+    contratos = q.all()
     return {
         "total_contratos": len(contratos),
         "total_valor_mensal": sum((c.valor_mensal or 0.0) for c in contratos),
         "total_valor_global": sum((c.valor_global_contrato or 0.0) for c in contratos),
         "total_valor_presente": sum((c.valor_presente_contrato or 0.0) for c in contratos),
+        "incluindo_retornados": bool(include_ret),
     }
 
 @app.get("/dashboard_data")
-def dashboard_data(db: Session = Depends(get_db)):
-    contratos = db.query(Contrato).all()
+def dashboard_data(
+    include_ret: int = Query(0, description="1 para incluir retornados"),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Contrato)
+    q = _query_oculta_retornados(q, mostrar_retornados=bool(include_ret))
+    contratos = q.all()
+
     valor_mensal_por_mes = {}
     for c in contratos:
         if not c.data_envio:
@@ -464,13 +500,23 @@ def dashboard_data(db: Session = Depends(get_db)):
         "valor_global_por_cliente": {"labels": list(valor_global_por_cliente.keys()), "data": list(valor_global_por_cliente.values())},
         "quantidade_por_cliente": {"labels": list(quantidade_por_cliente.keys()), "data": list(quantidade_por_cliente.values())},
         "distribuicao_meses_restantes": {"labels": list(dist_mr.keys()), "data": list(dist_mr.values())},
+        "incluindo_retornados": bool(include_ret),
     }
 
 # ── LISTAGEM & CADASTRO MANUAL ───────────────────────────────────────────────
 @app.get("/contratos_html", response_class=HTMLResponse)
-async def contratos_html(request: Request, db: Session = Depends(get_db)):
-    contratos = db.query(Contrato).all()
-    return templates.TemplateResponse("contratos.html", {"request": request, "contratos": contratos})
+async def contratos_html(
+    request: Request,
+    show_ret: int = Query(0, description="1 para mostrar também os retornados"),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Contrato)
+    q = _query_oculta_retornados(q, mostrar_retornados=bool(show_ret))
+    contratos = q.all()
+    return templates.TemplateResponse(
+        "contratos.html",
+        {"request": request, "contratos": contratos, "mostrando_retornados": bool(show_ret)},
+    )
 
 @app.get("/cadastrar", response_class=HTMLResponse)
 async def show_form(request: Request, db: Session = Depends(get_db)):
@@ -618,7 +664,7 @@ async def upload_csv(request: Request, file: UploadFile = File(...), db: Session
 
 # ── IMPORTAÇÃO DE MOVIMENTAÇÃO — UI ──────────────────────────────────────────
 @app.get("/importar_movimentacao", response_class=HTMLResponse)
-async def importar_movimentacao(request: Request):
+async def importar_movimentacao_page(request: Request):
     return templates.TemplateResponse("importar_movimentacao.html", {"request": request})
 
 def _render_mapeamento_fallback(headers: list[str]) -> HTMLResponse:
@@ -973,7 +1019,7 @@ async def importar_movimentacao_preview(
         "amostra": amostras,
     }
 
-# ── PRÉ-IMPORTAÇÃO (salva lote .json) + checagens ────────────────────────────
+# ── PRÉ-IMPORTAÇÃO (salva lote .json) ────────────────────────────────────────
 @app.post("/importar_movimentacao/preimport")
 async def importar_movimentacao_preimport(
     request: Request,
@@ -1077,7 +1123,6 @@ async def importar_movimentacao_preimport(
             nao_existe += 1
             continue
 
-        # cabeçalho
         cab_ok = False
         if cab_field:
             cab_ok = (
@@ -1194,7 +1239,6 @@ async def importar_movimentacao_commit(request: Request, db: Session = Depends(g
                 continue
             prazo_cab = cab.prazo_contratual
 
-            # hash do movimento (se modelo de import exists)
             ja_logado = False
             key_hash = make_import_key(contrato_numero, ativo, cod_cli, tipo, data_mov_iso)
             if ImportMovimentoRegistro is not None:
@@ -1205,7 +1249,6 @@ async def importar_movimentacao_commit(request: Request, db: Session = Depends(g
                     is not None
                 )
 
-            # RETORNO
             if tipo == "RETORNO":
                 alvo, matched_by = find_single_for_return(db, it_field, contrato_numero, r)
                 if alvo:
@@ -1248,7 +1291,6 @@ async def importar_movimentacao_commit(request: Request, db: Session = Depends(g
                     )
                 continue
 
-            # DUPLICADOS em ENVIO/TROCA
             if ja_logado and tipo in ("ENVIO", "TROCA"):
                 duplicated += 1
                 detalhes.append({"status": "DUPLICADO", **r})
@@ -1256,7 +1298,6 @@ async def importar_movimentacao_commit(request: Request, db: Session = Depends(g
 
             existente, matched_by = find_item_by_heuristics(db, it_field, contrato_numero=contrato_numero, r=r)
 
-            # TROCA -> remove existente e trata como ENVIO
             if tipo == "TROCA":
                 if existente:
                     add_contrato_log(
@@ -1279,7 +1320,6 @@ async def importar_movimentacao_commit(request: Request, db: Session = Depends(g
                 existente = None
                 tipo = "ENVIO"
 
-            # ENVIO (insere/atualiza)
             if tipo == "ENVIO":
                 if existente:
                     if serial:
@@ -1343,7 +1383,7 @@ async def importar_movimentacao_commit(request: Request, db: Session = Depends(g
                     calcular_valores_no_obj(novo)
 
                     db.add(novo)
-                    db.flush()  # garante novo.id no log
+                    db.flush()
                     add_contrato_log(
                         db,
                         novo,
@@ -1378,7 +1418,6 @@ async def importar_movimentacao_commit(request: Request, db: Session = Depends(g
                     )
                 continue
 
-            # tipo desconhecido
             skipped += 1
             detalhes.append({"status": "IGNORADO", **r})
 
@@ -1423,86 +1462,11 @@ async def api_ultima_importacao():
         data = json.load(f)
     return data
 
-@app.get("/ultima_importacao", response_class=HTMLResponse)
-async def ultima_importacao(request: Request):
-    data = None
-    if os.path.exists(LAST_IMPORT_FILE):
-        with open(LAST_IMPORT_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    try:
-        return templates.TemplateResponse("ultima_importacao.html", {"request": request, "dados": data})
-    except TemplateNotFound:
-        if not data:
-            return HTMLResponse("<div style='padding:16px;font-family:system-ui'>Ainda não há dados de última importação.</div>")
-
-        res = data.get("resultado", {})
-        order = list(res.keys())
-        color_map = {
-            "inseridos": "bg-success",
-            "atualizados": "bg-primary",
-            "removidos": "bg-danger",
-            "ignorados": "bg-secondary",
-            "duplicados": "bg-dark",
-            "cabecalhos_inexistentes": "bg-warning",
-        }
-        badges = "".join(
-            f"<div class='col-auto'><span class='badge {color_map.get(k,'bg-info')}'>{k.replace('_',' ').title()}: {res.get(k,0)}</span></div>"
-            for k in order
-        )
-
-        # evita f-string com aspas conflitantes
-        missing_html = ""
-        if data.get("contratos_sem_cabecalho"):
-            missing_html = (
-                "<div class='alert alert-warning p-2'>Contratos sem cabeçalho: "
-                + ", ".join(data.get("contratos_sem_cabecalho", []))
-                + "</div>"
-            )
-
-        head = """
-        <table class="table table-sm table-striped">
-        <thead><tr>
-          <th>Status</th><th>Contrato</th><th>Item</th><th>Descrição</th><th>Serial</th><th>Cod. Pro</th>
-          <th>Data mov.</th><th>Tipo</th><th>Qtd</th><th>Valor mensal</th><th>Meses rest.</th>
-          <th>Cliente</th><th>Ativo</th><th>Cod. Cliente</th><th>Obs.</th>
-        </tr></thead><tbody>
-        """
-        rows = []
-        for it in data.get("itens", []):
-            rows.append(
-                "<tr>"
-                f"<td>{it.get('status','')}</td>"
-                f"<td>{it.get('contrato','')}</td>"
-                f"<td>{it.get('item','')}</td>"
-                f"<td>{it.get('descricao_produto','')}</td>"
-                f"<td>{it.get('serial','')}</td>"
-                f"<td>{it.get('cod_pro','')}</td>"
-                f"<td>{it.get('data_mov','')}</td>"
-                f"<td>{it.get('tipo','')}</td>"
-                f"<td class='text-end'>{it.get('qtd','')}</td>"
-                f"<td class='text-end'>{it.get('valor_mensal','')}</td>"
-                f"<td class='text-end'>{it.get('meses_restantes','')}</td>"
-                f"<td>{it.get('cliente','')}</td>"
-                f"<td>{it.get('ativo','')}</td>"
-                f"<td>{it.get('cod_cli','')}</td>"
-                f"<td>{it.get('observacao','')}</td>"
-                "</tr>"
-            )
-        html = f"""
-        <!DOCTYPE html><html><head>
-          <meta charset="utf-8"><title>Última Importação</title>
-          <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
-        </head><body class="container py-4">
-          <h3>📦 Última Importação</h3>
-          <div class="mb-2"><code>{data.get('executed_at','')}</code></div>
-          <div class="row g-2 mb-3">{badges}</div>
-          {missing_html}
-          <div class="table-responsive">{head}{''.join(rows)}</tbody></table></div>
-          <div class="mt-2 d-flex gap-2">
-            <a class="btn btn-outline-secondary btn-sm" href="/api/ultima_importacao" target="_blank">Ver JSON</a>
-          </div>
-        </body></html>"""
-        return HTMLResponse(html)
+# ⚠️ LEGADO: mudou para evitar conflito com router_page
+# Em vez de renderizar aqui, apenas redireciona para a página /importacoes
+@app.get("/ultima_importacao_legacy", include_in_schema=False)
+async def ultima_importacao_legacy_redirect():
+    return RedirectResponse(url="/importacoes", status_code=307)
 
 # ── Fluxo legado validar/confirmar — com logs ────────────────────────────────
 @app.post("/validar_mapeamento", response_class=HTMLResponse)
@@ -1738,3 +1702,12 @@ try:
     app.include_router(admin_users.router, prefix="/admin", tags=["Usuários"])
 except Exception as e:
     print("[WARN] Router admin_users indisponível:", e)
+
+# ── Diagnóstico: lista todas as rotas ativas ─────────────────────────────────
+@app.get("/_routes")
+def _routes(request: Request):
+    out = []
+    for r in request.app.routes:
+        methods = list(getattr(r, "methods", []) or [])
+        out.append({"path": getattr(r, "path", str(r)), "methods": methods, "name": getattr(r, "name", "")})
+    return out

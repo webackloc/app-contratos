@@ -1,6 +1,11 @@
 {% extends "base.html" %}
 {% block title %}Editar Contrato (Cabeçalho){% endblock %}
 
+{# v2025-08-21.1: adiciona campo cod_cli no formulário de cabeçalho.
+   - Mantém compatibilidade com nomes antigos de propriedades.
+   - Não altera rotas nem comportamento de outros campos.
+#}
+
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h2>Editar Contrato (Cabeçalho)</h2>
@@ -11,36 +16,57 @@
   <div class="card-body">
     <form method="post" action="/contratos/cabecalhos/{{ cab.id }}/editar?next={{ request.query_params.get('next','') }}">
       <div class="row g-3">
+
         <div class="col-md-6">
           <label class="form-label">Nome do Cliente</label>
           <input type="text" name="nome_cliente" class="form-control" required
                  value="{{ cab.nome_cliente or cab.nome_cli or '' }}">
         </div>
+
         <div class="col-md-6">
           <label class="form-label">CNPJ</label>
           <input type="text" name="cnpj" class="form-control" required
                  value="{{ cab.cnpj or '' }}" placeholder="99.999.999/9999-99">
         </div>
+
+        <!-- NOVO CAMPO: CODIGO DO CLIENTE -->
+        <div class="col-md-4">
+          <label class="form-label">Código do Cliente (cod_cli)</label>
+          <input
+            type="text"
+            name="cod_cli"
+            class="form-control"
+            required
+            value="{{ cab.cod_cli or '' }}"
+            placeholder="Ex.: 000123"
+          >
+          <small class="form-text text-muted">Usado nas buscas e vínculo dos contratos.</small>
+        </div>
+
         <div class="col-md-4">
           <label class="form-label">Contrato Num</label>
           <input type="text" name="contrato_num" class="form-control"
                  value="{{ cab.contrato_n or cab.contrato_num or cab.numero or cab.numero_contrato or '' }}">
         </div>
+
         <div class="col-md-4">
           <label class="form-label">Prazo Contratual (meses)</label>
           <input type="number" name="prazo_contratual" class="form-control" min="0" required
                  value="{{ cab.prazo_contratual if cab.prazo_contratual is not none else cab.periodo_contratual }}">
         </div>
+
         <div class="col-md-4">
           <label class="form-label">Índice de Reajuste (ano)</label>
           <input type="text" name="indice_reajuste" class="form-control" placeholder="ex: 6% ou 0,06"
                  value="{{ cab.indice_reajuste or '' }}">
         </div>
+
         <div class="col-md-6">
           <label class="form-label">Vendedor</label>
           <input type="text" name="vendedor" class="form-control"
                  value="{{ cab.vendedor or '' }}">
         </div>
+
       </div>
 
       <div class="mt-4 d-flex gap-2">

@@ -3,63 +3,193 @@
 
 {% block content %}
 <div class="container">
-    <h2 class="mb-4">Importação de Movimentação de Itens</h2>
+  <h2 class="mb-4">Importação de Movimentação de Itens</h2>
 
+  {# =========================================================================
+     Versão: 1.3.0 (2025-08-26)
+     CHANGELOG:
+       - Mantido fluxo existente (upload -> mapeamento -> processar).
+       - Adicionada pré-visualização opcional no CLIENTE (não altera upload).
+       - Pré-visualização limita apenas a exibição (50 linhas) para não travar a UI.
+     Observação:
+       - O servidor recebe o arquivo COMPLETO; nenhuma linha é cortada aqui.
+     ========================================================================= #}
+
+  {% if not headers %}
     <!-- Passo 1: Upload do CSV -->
-    {% if not headers %}
-        <div class="alert alert-info">
-            Envie um arquivo CSV contendo os itens com a coluna <strong><code>tp_transacao</code></strong> preenchida com: <code>ENVIO</code>, <code>RETORNO</code> ou <code>TROCA</code>.
-            <br><br>
-            A coluna <strong><code>período</code></strong> <strong>não</strong> deve ser enviada — ela será preenchida automaticamente com base no cabeçalho do contrato (relacionando <code>cod_cli</code> + <code>contrato_n</code>).
+    <div class="alert alert-info">
+      Envie um arquivo CSV contendo os itens com a coluna <strong><code>tp_transacao</code></strong> preenchida com:
+      <code>ENVIO</code>, <code>RETORNO</code> ou <code>TROCA</code>.<br><br>
+      A coluna <strong><code>período</code></strong> <strong>não</strong> deve ser enviada — ela será preenchida
+      automaticamente com base no cabeçalho do contrato (relacionando <code>cod_cli</code> + <code>contrato_n</code>).
+    </div>
+
+    <form action="/importar_movimentacao" method="post" enctype="multipart/form-data">
+      <div class="mb-3">
+        <label for="file" class="form-label">Selecione o arquivo CSV:</label>
+        <input class="form-control" type="file" id="file" name="file" accept=".csv" required>
+      </div>
+
+      <div class="d-flex gap-2 mb-3">
+        <button type="submit" class="btn btn-primary">
+          <i class="bi bi-upload"></i> Enviar Arquivo
+        </button>
+        <!-- Pré-visualização cliente (não altera o upload nem corta linhas do servidor) -->
+        <button type="button" id="btnPreview" class="btn btn-outline-secondary">
+          Pré-visualizar (cliente)
+        </button>
+      </div>
+
+      <!-- Card de preview local -->
+      <div id="cardPreview" class="card d-none">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span>Pré-visualização local do CSV (somente exibição)</span>
+          <small class="text-muted">
+            Linhas totais no arquivo: <span id="totalLinhas">0</span> • Mostrando até <span id="limiteExibicao">50</span>
+          </small>
         </div>
-
-        <form action="/importar_movimentacao" method="post" enctype="multipart/form-data">
-            <div class="mb-3">
-                <label for="file" class="form-label">Selecione o arquivo CSV:</label>
-                <input class="form-control" type="file" id="file" name="file" accept=".csv" required>
-            </div>
-            <button type="submit" class="btn btn-primary">
-                <i class="bi bi-upload"></i> Enviar Arquivo
-            </button>
-        </form>
-
-    {% else %}
-        <!-- Passo 2: Mapeamento das colunas -->
-        <div class="alert alert-warning">
-            <strong>Passo 2:</strong> Mapeie as colunas do seu arquivo CSV com os campos do sistema.
+        <div class="card-body">
+          <div class="mb-2">
+            <textarea id="jsonSample" class="form-control" rows="6" readonly></textarea>
+          </div>
+          <div class="table-responsive">
+            <table class="table table-sm table-striped" id="tblPreview">
+              <thead>
+                <tr id="tblHead"></tr>
+              </thead>
+              <tbody id="tblBody"></tbody>
+            </table>
+          </div>
+          <small class="text-muted">
+            Pré-visualização limita apenas a exibição para manter a página responsiva. O upload envia o arquivo completo.
+          </small>
         </div>
+      </div>
+    </form>
 
-        <form action="/processar_movimentacao" method="post">
-            <input type="hidden" name="csv_path" value="{{ csv_path }}">
+  {% else %}
+    <!-- Passo 2: Mapeamento das colunas -->
+    <div class="alert alert-warning">
+      <strong>Passo 2:</strong> Mapeie as colunas do seu arquivo CSV com os campos do sistema.
+    </div>
 
-            <div class="row">
-                {% for field in required_fields %}
-                <div class="col-md-6 mb-3">
-                    <label class="form-label">Campo <strong>{{ field }}</strong></label>
-                    <select name="map_{{ field }}" class="form-select" required>
-                        <option value="" disabled selected>Selecione a coluna correspondente</option>
-                        {% for header in headers %}
-                        <option value="{{ header }}">{{ header }}</option>
-                        {% endfor %}
-                    </select>
-                </div>
-                {% endfor %}
-            </div>
+    <form action="/processar_movimentacao" method="post">
+      <input type="hidden" name="csv_path" value="{{ csv_path }}">
 
-            <button type="submit" class="btn btn-success">
-                <i class="bi bi-play-circle"></i> Processar Importação
-            </button>
-        </form>
-    {% endif %}
+      <div class="row">
+        {% for field in required_fields %}
+        <div class="col-md-6 mb-3">
+          <label class="form-label">Campo <strong>{{ field }}</strong></label>
+          <select name="map_{{ field }}" class="form-select" required>
+            <option value="" disabled selected>Selecione a coluna correspondente</option>
+            {% for header in headers %}
+            <option value="{{ header }}">{{ header }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        {% endfor %}
+      </div>
+
+      <button type="submit" class="btn btn-success">
+        <i class="bi bi-play-circle"></i> Processar Importação
+      </button>
+    </form>
+  {% endif %}
 </div>
 {% endblock %}
 
-<!--
-Versão: 1.2.0
-Data: 2025-08-06
-Alterações:
-- Inclusão do passo 2: mapeamento das colunas do CSV com os campos do sistema
-- Mantida a lógica de upload existente
-- Adicionado suporte ao caminho temporário do CSV via campo oculto
-- Layout preservado com Bootstrap 5
--->
+{% block scripts %}
+{% if not headers %}
+<script>
+/* importar_movimentacao.html – preview cliente
+   v1.3.0 (2025-08-26)
+   - Lê CSV no navegador, exibe contagem total e amostra (50 linhas).
+   - Não altera o upload (servidor segue recebendo 100% do arquivo).
+*/
+(function(){
+  const $file = document.getElementById('file');
+  const $btn = document.getElementById('btnPreview');
+  const $card = document.getElementById('cardPreview');
+  const $total = document.getElementById('totalLinhas');
+  const $limiteExibicao = document.getElementById('limiteExibicao');
+  const $json = document.getElementById('jsonSample');
+  const $thead = document.getElementById('tblHead');
+  const $tbody = document.getElementById('tblBody');
+
+  const TABLE_SAMPLE_LIMIT = 50;
+  $limiteExibicao.textContent = TABLE_SAMPLE_LIMIT;
+
+  function detectSep(text){
+    const sc = (text.match(/;/g)||[]).length;
+    const cc = (text.match(/,/g)||[]).length;
+    return sc >= cc ? ';' : ',';
+  }
+
+  function parseCSV(text){
+    const sep = detectSep(text);
+    const lines = text.split(/\r?\n/).filter(l => l.trim().length);
+    if (!lines.length) return {headers:[], rows:[]};
+    const headers = lines[0].split(sep).map(h => h.trim());
+    const rows = [];
+    for (let i=1; i<lines.length; i++){
+      const cols = lines[i].split(sep);
+      if (cols.every(c => !String(c).trim())) continue;
+      const row = {};
+      headers.forEach((h, idx) => row[h] = (cols[idx] ?? '').trim());
+      rows.push(row);
+    }
+    return {headers, rows};
+  }
+
+  function renderTable(headers, rows){
+    $thead.innerHTML = '';
+    $tbody.innerHTML = '';
+    // head
+    headers.forEach(h => {
+      const th = document.createElement('th');
+      th.textContent = h;
+      $thead.appendChild(th);
+    });
+    // body (limitado só na exibição)
+    rows.slice(0, TABLE_SAMPLE_LIMIT).forEach(r => {
+      const tr = document.createElement('tr');
+      headers.forEach(h => {
+        const td = document.createElement('td');
+        td.textContent = (r[h] ?? '');
+        tr.appendChild(td);
+      });
+      $tbody.appendChild(tr);
+    });
+  }
+
+  function readAsText(file){
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result || ''));
+      fr.onerror = () => reject(fr.error || new Error('Falha ao ler arquivo.'));
+      fr.readAsText(file);
+    });
+  }
+
+  $btn?.addEventListener('click', async (ev) => {
+    ev.preventDefault();
+    const f = $file?.files?.[0];
+    if (!f){ alert('Selecione um arquivo CSV.'); return; }
+
+    try{
+      const text = await readAsText(f);
+      const {headers, rows} = parseCSV(text);
+      $total.textContent = rows.length;
+      $json.value = JSON.stringify({headers, sample: rows.slice(0, TABLE_SAMPLE_LIMIT)}, null, 2);
+      renderTable(headers, rows);
+      $card.classList.remove('d-none');
+      $card.scrollIntoView({behavior:'smooth', block:'start'});
+    }catch(err){
+      console.error(err);
+      alert('Não foi possível pré-visualizar o arquivo.');
+    }
+  });
+})();
+</script>
+{% endif %}
+{% endblock %}

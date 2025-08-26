@@ -1,12 +1,16 @@
 {# =============================================================================
    Template: mapeamento_colunas.html
-   Versão: v0.3.1 - 2025-08-11
+   Versão: v0.6.1 - 2025-08-26
    CHANGELOG:
-     - [+] Campos adicionados ao mapeamento: "descricao_produto", "serial" e "cod_pro".
-     - [=] Mantido fluxo em 3 etapas (Preview → Pré-importar → Importar).
-     - [=] Botão "Importar agora" segue desabilitado até a pré-importação.
+     - [FIX] Preview agora envia TODAS as linhas ao backend
+             (buildLinesFromCSV(false)). Mantido comportamento do restante.
+     - [*] TROCA continua com DUAS LINHAS com o mesmo número de OS.
+           Cada linha informa "tipo_mov_troca" = ENVIO ou RETORNO.
+     - [-] Removidos do mapeamento: ativo_antigo, ativo_novo, ativo_substituto (evitar confusão).
+     - [+] Novos campos canônicos: numero_os, tipo_mov_troca.
+     - [*] Preview exibe colunas OS e Troca; instruções de UX atualizadas.
    DEPENDÊNCIAS:
-     - Contexto precisa conter: headers (lista de strings com os cabeçalhos do CSV)
+     - Bootstrap 5 disponível no base.html (para tooltips).
    ============================================================================= #}
 
 {% extends "base.html" %}
@@ -15,53 +19,55 @@
 {% block content %}
 <h3>🧭 Mapeamento de Colunas (Preview / Pré-importação / Importar)</h3>
 <p class="text-muted mb-3">
-  Associe os campos canônicos às colunas do seu CSV. Dica: mapeie <strong>Ativo</strong> e <strong>cod_cli</strong>
-  quando disponíveis (usados na checagem de duplicidade). Para itens, dê preferência a <strong>Descrição do produto</strong>
-  quando existir no arquivo.
+  Associe os campos canônicos às colunas do seu CSV. Dica: mapeie
+  <strong>contrato_num</strong>, <strong>cod_cli</strong>, <strong>ativo</strong>,
+  <strong>data_mov</strong> e <strong>tp_transacao</strong> para validação completa.
+  <br>
+  <strong>Para TROCA:</strong> não informe “ativo antigo/novo” na mesma linha.
+  Em vez disso, mande <u>duas linhas</u> com o mesmo <strong>numero_os</strong> e
+  preencha <strong>tipo_mov_troca</strong> com <code>ENVIO</code> ou <code>RETORNO</code>
+  em cada linha.
 </p>
 
-<div class="mb-2">
-  <strong>Cabeçalhos detectados:</strong>
-  <div class="small font-monospace border rounded p-2" style="white-space:pre-wrap;">
-    {{ headers|join(", ") }}
-  </div>
-</div>
-
-<form id="form-mov" class="mt-3" enctype="multipart/form-data" method="post">
+<form id="form-mov" class="mt-3" enctype="multipart/form-data" method="post" onsubmit="return false;">
   <div class="mb-3">
     <label for="csvfile" class="form-label">Arquivo CSV</label>
     <input type="file" id="csvfile" name="file" accept=".csv" required class="form-control">
-    <div class="form-text">Reenvie o arquivo ao fazer <em>Preview</em> ou <em>Pré-importar</em>.</div>
+    <div class="form-text">Carregue o arquivo e defina o mapeamento; o preview roda no navegador.</div>
   </div>
 
   <div class="row g-3">
     {% set campos = [
-      ("contrato", "Nº do contrato (obrigatório)"),
-      ("item", "Item / código (obrigatório)"),
-      ("descricao_produto", "Descrição do produto (preferencial)"),
+      ("numero_os", "Número da OS (TROCA)"),
+      ("contrato_num", "Nº do contrato (obrigatório)"),
+      ("cod_cli", "Código do Cliente (obrigatório)"),
+      ("nome_cli", "Nome do Cliente"),
+      ("tp_transacao", "Tipo da transação (ENVIO/RETORNO/TROCA) (obrigatório)"),
+      ("tipo_mov_troca", "Fase da TROCA (ENVIO/RETORNO)"),
+      ("data_mov", "Data do movimento (YYYY-MM-DD ou DD/MM/YYYY) (obrigatório)"),
+      ("ativo", "Ativo (obrigatório, exceto TROCA)"),
+      ("descricao_produto", "Descrição do produto"),
+      ("cod_pro", "Código do produto"),
       ("serial", "Serial (opcional)"),
-      ("cod_pro", "Código do produto (opcional)"),
-      ("data_mov", "Data do movimento (obrigatório)"),
-      ("tipo", "Tipo do movimento"),
-      ("qtd", "Quantidade"),
-      ("valor_mensal", "Valor mensal"),
-      ("meses_restantes", "Meses restantes"),
-      ("cliente", "Cliente"),
-      ("observacao", "Observação"),
-      ("ativo", "Ativo (opcional — recomendado)"),
-      ("cod_cli", "Código do Cliente (cod_cli) (opcional — recomendado)")
+      ("valor_mensal", "Valor mensal (opcional)")
     ] %}
 
-    {% for key, rotulo in campos %}
+    {% macro select_block(key, rotulo) -%}
     <div class="col-md-6">
       <label class="form-label">{{ rotulo }}</label>
       <select class="form-select map-select" data-canon="{{ key }}">
         <option value="">— não mapear —</option>
-        {% for h in headers %}
-          <option value="{{ h }}">{{ h }}</option>
-        {% endfor %}
+        {% if headers %}
+          {% for h in headers %}
+            <option value="{{ h }}">{{ h }}</option>
+          {% endfor %}
+        {% endif %}
       </select>
     </div>
+    {%- endmacro %}
+
+    {% for key, rotulo in campos %}
+      {{ select_block(key, rotulo) }}
     {% endfor %}
   </div>
 
@@ -70,114 +76,321 @@
   <div class="row g-3 mt-2">
     <div class="col-md-3">
       <label class="form-label">Delimitador</label>
-      <select name="delimiter" class="form-select">
+      <select id="delimiter" name="delimiter" class="form-select">
         <option value="auto" selected>Auto</option>
         <option value=";">;</option>
         <option value=",">,</option>
         <option value="|">|</option>
-        <option value="\\t">TAB</option>
+        <option value="\t">TAB</option>
       </select>
     </div>
     <div class="col-md-3">
-      <label class="form-label">Encoding</label>
-      <select name="encoding" class="form-select">
+      <label class="form-label">Encoding (dica)</label>
+      <select id="encoding" name="encoding" class="form-select">
         <option value="utf-8-sig" selected>utf-8-sig</option>
         <option value="latin1">latin1</option>
         <option value="utf-8">utf-8</option>
       </select>
+      <div class="form-text">O navegador tentará decodificar automaticamente.</div>
     </div>
     <div class="col-md-3">
       <label class="form-label">Amostra de linhas</label>
-      <input type="number" class="form-control" name="sample_rows" value="5" min="1" max="50">
+      <input type="number" class="form-control" id="sample_rows" name="sample_rows" value="5" min="1" max="50">
     </div>
     <div class="col-md-3">
       <label class="form-label">Limite de linhas</label>
-      <input type="number" class="form-control" name="max_rows" value="200000" min="1000" max="1000000">
+      <input type="number" class="form-control" id="max_rows" name="max_rows" value="200000" min="1000" max="1000000">
     </div>
   </div>
 
-  <div class="mt-3 d-flex gap-2">
+  <div class="mt-3 d-flex flex-wrap gap-2">
     <button id="btn-preview"   type="button" class="btn btn-outline-secondary">Gerar preview</button>
-    <button id="btn-preimport" type="button" class="btn btn-warning">Pré-importar (salvar lote)</button>
+    <button id="btn-preimport" type="button" class="btn btn-warning" disabled>Pré-importar (salvar lote)</button>
     <button id="btn-commit"    type="button" class="btn btn-primary" disabled>Importar agora</button>
     <a href="/dashboard" class="btn btn-light">Voltar</a>
+    <div class="ms-auto">
+      <span class="me-2">Status do lote:</span>
+      <span id="lote-id" class="badge bg-secondary">—</span>
+    </div>
   </div>
 </form>
 
 <hr>
 
-<div class="d-flex align-items-center gap-2 mb-2">
-  <strong>Status do lote:</strong>
-  <span id="lote-id" class="badge bg-secondary">—</span>
+<h4 class="mt-1">Resultado</h4>
+<div class="border rounded p-3 mb-3" style="background:#f8f9fa;">
+  <pre id="resultado" class="mb-0" style="max-height:420px; overflow:auto;">— gere o preview —</pre>
 </div>
 
-<h4 class="mt-1">Resultado</h4>
-<pre id="resultado" class="border rounded p-3" style="max-height:420px; overflow:auto; background:#f8f9fa;">— gere o preview ou faça a pré-importação —</pre>
+<div id="tabela-preview" class="d-none">
+  <h5 class="mb-2">Linhas (lote <span id="lote-id-inline">—</span>)</h5>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Transação</th>
+          <th>Troca</th>
+          <th>OS</th>
+          <th>Contrato</th>
+          <th>Cliente</th>
+          <th>Ativo</th>
+          <th>Data</th>
+          <th>Hash</th>
+          <th>Severidade</th>
+        </tr>
+      </thead>
+      <tbody id="tbody-preview"></tbody>
+    </table>
+  </div>
+</div>
 
 <script>
 (function(){
-  const form = document.getElementById('form-mov');
-  const res  = document.getElementById('resultado');
-  const mapInput = document.getElementById('mapping-json');
-  const btnPreview   = document.getElementById('btn-preview');
-  const btnPreimport = document.getElementById('btn-preimport');
-  const btnCommit    = document.getElementById('btn-commit');
-  const loteBadge    = document.getElementById('lote-id');
+  const fileInput   = document.getElementById('csvfile');
+  const res         = document.getElementById('resultado');
+  const mapInput    = document.getElementById('mapping-json');
+  const btnPreview  = document.getElementById('btn-preview');
+  const btnPreimport= document.getElementById('btn-preimport');
+  const btnCommit   = document.getElementById('btn-commit');
+  const loteBadge   = document.getElementById('lote-id');
+  const loteInline  = document.getElementById('lote-id-inline');
+  const tbodyPreview= document.getElementById('tbody-preview');
+  const tabelaPreview= document.getElementById('tabela-preview');
 
-  function buildFormData() {
-    // Monta JSON de mapeamento { canon: "cabeçalho" }
+  const delimiterSel= document.getElementById('delimiter');
+  const sampleRowsSel= document.getElementById('sample_rows');
+  const maxRowsSel  = document.getElementById('max_rows');
+
+  let currentLoteId = null;
+
+  function detectDelimiter(line){
+    if (line.includes(';')) return ';';
+    if (line.includes(',')) return ',';
+    if (line.includes('|')) return '|';
+    if (line.includes('\t')) return '\t';
+    return ',';
+  }
+
+  function parseCSV(text, delim){
+    const rows = [];
+    let i = 0, cur = '', inQuotes = false, row = [];
+    const d = delim;
+    while (i < text.length){
+      const ch = text[i];
+      if (ch === '"'){
+        if (inQuotes && text[i+1] === '"'){ cur += '"'; i += 2; continue; }
+        inQuotes = !inQuotes; i++; continue;
+      }
+      if (!inQuotes && (ch === '\n' || ch === '\r')){
+        if (ch === '\r' && text[i+1] === '\n'){ i++; }
+        row.push(cur); rows.push(row); row = []; cur=''; i++; continue;
+      }
+      if (!inQuotes && ch === d){
+        row.push(cur); cur=''; i++; continue;
+      }
+      cur += ch; i++;
+    }
+    if (cur.length || row.length) { row.push(cur); rows.push(row); }
+    return rows;
+  }
+
+  function getSelectedMapping(){
     const mapping = {};
     document.querySelectorAll('.map-select').forEach(s=>{
       const canon = s.getAttribute('data-canon');
       const val = (s.value || '').trim();
       if (val) mapping[canon] = val;
     });
-    mapInput.value = JSON.stringify(mapping);
-    return new FormData(form);
+    return mapping;
   }
 
-  async function post(url, fd) {
-    const r = await fetch(url, { method: 'POST', body: fd });
+  function setHeadersInSelects(headers){
+    document.querySelectorAll('.map-select').forEach(s=>{
+      const keepFirst = s.options[0];
+      s.innerHTML = '';
+      s.appendChild(keepFirst);
+      headers.forEach(h=>{
+        const opt = document.createElement('option');
+        opt.value = h; opt.textContent = h;
+        s.appendChild(opt);
+      });
+    });
+  }
+
+  fileInput.addEventListener('change', async () => {
+    const f = fileInput.files[0];
+    if (!f) return;
+    const text = await f.text();
+    let d = delimiterSel.value;
+    if (d === 'auto') d = detectDelimiter(text.split(/\r?\n/)[0] || '');
+    const rows = parseCSV(text, d);
+    if (!rows.length) return;
+    const headers = rows[0].map(h => h.trim());
+    setHeadersInSelects(headers);
+    res.textContent = `Arquivo carregado. Detectado delimitador "${d}". Cabeçalhos: ` + JSON.stringify(headers);
+  });
+
+  function buildLinesFromCSV(limitForPreview=false){
+    const f = fileInput.files[0];
+    if (!f) { throw new Error('Selecione um arquivo CSV.'); }
+    const mapping = getSelectedMapping();
+    mapInput.value = JSON.stringify(mapping);
+
+    return f.text().then(text=>{
+      let d = delimiterSel.value;
+      if (d === 'auto') d = detectDelimiter(text.split(/\r?\n/)[0] || '');
+      const rows = parseCSV(text, d);
+      if (rows.length < 2) throw new Error('CSV sem dados.');
+      const headers = rows[0];
+      const idx = {};
+      headers.forEach((h,i)=> idx[h] = i);
+
+      const maxRows = parseInt(maxRowsSel.value || '200000', 10);
+      const sample = parseInt(sampleRowsSel.value || '5', 10);
+      const lim = limitForPreview ? Math.min(1 + sample, rows.length) : Math.min(1 + maxRows, rows.length);
+
+      const linhas = [];
+      for (let r=1; r<lim; r++){
+        const row = rows[r];
+        if (!row || (row.length === 1 && row[0].trim()==='')) continue;
+        const obj = {};
+        Object.keys(mapping).forEach(canon=>{
+          const col = mapping[canon];
+          const j = idx[col];
+          obj[canon] = (j != null && row[j] != null) ? row[j].trim() : '';
+        });
+        if (!obj['tp_transacao'] && obj['tipo']) obj['tp_transacao'] = obj['tipo'];
+        linhas.push(obj);
+      }
+      return {linhas, delimiter:d, headers};
+    });
+  }
+
+  async function postJSON(url, payload){
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
     const t = await r.text();
     try { return JSON.parse(t); } catch { return t; }
   }
 
-  btnPreview.addEventListener('click', async () => {
-    res.textContent = 'Processando preview...';
-    const out = await post('/importar_movimentacao/preview', buildFormData());
+  function renderResumo(out){
     res.textContent = (typeof out === 'string') ? out : JSON.stringify(out, null, 2);
-  });
+  }
 
-  btnPreimport.addEventListener('click', async () => {
-    res.textContent = 'Salvando lote (pré-importação)...';
-    const out = await post('/importar_movimentacao/preimport', buildFormData());
-    res.textContent = (typeof out === 'string') ? out : JSON.stringify(out, null, 2);
-    if (out && out.ok) {
-      btnCommit.removeAttribute('disabled');
-      if (out.lote_id) loteBadge.textContent = out.lote_id;
-      loteBadge.className = 'badge bg-success';
-    } else {
+  function setLote(id, ok=true){
+    currentLoteId = id;
+    const badge = document.getElementById('lote-id');
+    const inline = document.getElementById('lote-id-inline');
+    badge.textContent = id ?? '—';
+    inline.textContent = id ?? '—';
+    badge.className = 'badge ' + (ok ? 'bg-success' : 'bg-secondary');
+  }
+
+  function badgeSev(sev, msgs){
+    const span = document.createElement('span');
+    if (sev === 'OK'){ span.className = 'badge bg-success'; span.textContent = 'OK'; }
+    else if (sev === 'AVISO'){ span.className = 'badge bg-warning text-dark'; span.textContent = 'AVISO'; }
+    else { span.className = 'badge bg-danger'; span.textContent = 'ERRO'; }
+    if (msgs){
+      span.setAttribute('data-bs-toggle', 'tooltip');
+      span.setAttribute('title', Array.isArray(msgs) ? msgs.join(' • ') : String(msgs));
+    }
+    return span;
+  }
+
+  function enableTooltips(){
+    [...document.querySelectorAll('[data-bs-toggle="tooltip"]')].forEach(el=>{
+      new bootstrap.Tooltip(el);
+    });
+  }
+
+  function fillPreviewTable(itens){
+    tbodyPreview.innerHTML = '';
+    itens.forEach(it=>{
+      const p = it.payload || {};
+      const tr = document.createElement('tr');
+
+      const tdIdx = document.createElement('td'); tdIdx.textContent = it.linha_idx; tr.appendChild(tdIdx);
+      const tdTp  = document.createElement('td'); tdTp.textContent  = p.tp_transacao || ''; tr.appendChild(tdTp);
+      const tdTro = document.createElement('td'); tdTro.textContent = p.tipo_mov_troca || ''; tr.appendChild(tdTro);
+      const tdOS  = document.createElement('td'); tdOS.textContent  = p.numero_os || ''; tr.appendChild(tdOS);
+      const tdCtr = document.createElement('td'); tdCtr.textContent = p.contrato_num || p.contrato || ''; tr.appendChild(tdCtr);
+      const tdCli = document.createElement('td'); tdCli.textContent = p.cod_cli || p.cliente || ''; tr.appendChild(tdCli);
+      const tdAtv = document.createElement('td'); tdAtv.textContent = p.ativo || ''; tr.appendChild(tdAtv);
+      const tdDat = document.createElement('td'); tdDat.textContent = p.data_mov || ''; tr.appendChild(tdDat);
+
+      const tdHash= document.createElement('td');
+      const code = document.createElement('code'); code.style.fontSize='.75rem'; code.className='text-break';
+      code.textContent = p.mov_hash || '-'; tdHash.appendChild(code); tr.appendChild(tdHash);
+
+      const tdSev = document.createElement('td');
+      const sev = p.severidade || it.status || 'OK';
+      const msgs = (sev === 'ERRO') ? p.erros : (sev === 'AVISO' ? p.avisos : null);
+      tdSev.appendChild(badgeSev(sev, msgs)); tr.appendChild(tdSev);
+
+      tbodyPreview.appendChild(tr);
+    });
+    tabelaPreview.classList.remove('d-none');
+    enableTooltips();
+  }
+
+  document.getElementById('btn-preview').addEventListener('click', async () => {
+    try{
+      res.textContent = 'Processando preview...';
+      // [FIX v0.6.1] Envia TODAS as linhas para o backend (remove corte de 5)
+      const {linhas} = await buildLinesFromCSV(false);
+      if (!linhas.length){ throw new Error('Nenhuma linha mapeada.'); }
+      const out = await postJSON('/importar_movimentacao/preview', {linhas});
+      renderResumo(out);
+      if (out && out.lote_id){
+        setLote(out.lote_id, true);
+        btnPreimport.removeAttribute('disabled');
+        btnCommit.setAttribute('disabled','disabled');
+      } else {
+        setLote(null, false);
+        btnPreimport.setAttribute('disabled','disabled');
+        btnCommit.setAttribute('disabled','disabled');
+      }
+    }catch(err){
+      res.textContent = 'Erro no preview: ' + (err && err.message ? err.message : err);
+      setLote(null, false);
+      btnPreimport.setAttribute('disabled','disabled');
       btnCommit.setAttribute('disabled','disabled');
-      loteBadge.textContent = '—';
-      loteBadge.className = 'badge bg-secondary';
     }
   });
 
-  btnCommit.addEventListener('click', async () => {
-    res.textContent = 'Executando importação (commit)...';
-    const r = await fetch('/importar_movimentacao/commit', { method: 'POST' });
+  document.getElementById('btn-preimport').addEventListener('click', async () => {
+    if (!currentLoteId){ res.textContent = 'Nenhum lote disponível. Faça o Preview primeiro.'; return; }
+    res.textContent = 'Carregando itens do lote...';
+    const r = await fetch(`/importar_movimentacao/lote/${currentLoteId}`);
     const t = await r.text();
-    try {
-      const out = JSON.parse(t);
-      res.textContent = JSON.stringify(out, null, 2);
-      if (out && out.ok) {
-        // terminou; desabilita até novo pré-import
-        btnCommit.setAttribute('disabled','disabled');
-        loteBadge.textContent = '—';
-        loteBadge.className = 'badge bg-secondary';
-      }
-    } catch {
-      res.textContent = t;
+    let out;
+    try { out = JSON.parse(t); } catch { out = t; }
+    renderResumo(out);
+    if (out && out.itens){
+      fillPreviewTable(out.itens);
+      btnCommit.removeAttribute('disabled');
+    } else {
+      btnCommit.setAttribute('disabled','disabled');
+    }
+  });
+
+  document.getElementById('btn-commit').addEventListener('click', async () => {
+    if (!currentLoteId){ res.textContent = 'Nenhum lote para importar.'; return; }
+    res.textContent = 'Executando importação (commit)...';
+    const r = await fetch(`/importar_movimentacao/commit/${currentLoteId}`, { method: 'POST' });
+    const t = await r.text();
+    let out;
+    try { out = JSON.parse(t); } catch { out = t; }
+    renderResumo(out);
+    if (out && (out.ok != null)){
+      btnCommit.setAttribute('disabled','disabled');
+      btnPreimport.setAttribute('disabled','disabled');
+      setLote(null, false);
     }
   });
 })();

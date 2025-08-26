@@ -1,151 +1,508 @@
+# =============================================================================
 # routers/contratos_sync.py
-# ------------------------------------------------------------
-# Sincroniza período contratual a partir do cabeçalho e
-# recalcula meses_restantes, valor_global_contrato e
-# valor_presente_contrato.
-#
-# Endpoints:
-# - POST /contratos/sincronizar/{contrato_num}  -> um contrato
-# - POST /contratos/sincronizar                 -> TODOS os contratos
-# ------------------------------------------------------------
+# Versão: v2.2.0 (2025-08-26)
+# O que mudou nesta versão:
+#   • Batch sync mais robusto:
+#       - PRAGMA journal_mode=WAL + busy_timeout (sem alterar o engine global)
+#       - rollback() garantido antes de novos commits (evita PendingRollbackError)
+#       - retries leves para "database is locked" em listagem e commits parciais
+#   • Mantidos recursos da v2.1.3:
+#       - Compat: aliases de contexto ('contratos', 'itens', incluirRetornados)
+#       - Fallback de template (contratos_lista.html → contratos.html → contratos_list.html)
+#       - Filtros por cliente/contrato/ativo; paginação/ordenação
+#       - Agregações via subquery (evita cartesian product)
+#       - Export CSV/XLSX
+# =============================================================================
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from starlette.responses import RedirectResponse
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from starlette.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import func, cast, Numeric, String, desc, asc, and_, or_, text
+from fastapi.templating import Jinja2Templates
+from jinja2 import TemplateNotFound
 
 from database import get_db
 from models import Contrato, ContratoCabecalho
+try:
+    from models import ContratoLog  # opcional
+except Exception:
+    ContratoLog = None  # type: ignore
+
 from utils.recalculo_contratos import (
     calc_meses_restantes, calc_valor_global, calc_valor_presente
 )
+from io import StringIO, BytesIO
+import logging
+import time
 
-router = APIRouter()
+templates = Jinja2Templates(directory="templates")
+router = APIRouter(tags=["Contratos"])
 
+# --------------------- helpers ---------------------
 
 def _pick_attr(model, *names):
-    """
-    Retorna (nome, atributo) do primeiro nome existente no model, senão (None, None).
-    Permite tolerância a variações de nomes de colunas, ex.: contrato_n vs contrato_num.
-    """
     for n in names:
         attr = getattr(model, n, None)
         if attr is not None:
             return n, attr
     return None, None
 
+def _ilike_ci(column, term: str | None):
+    if not term:
+        return True
+    term = f"%{term.strip().lower()}%"
+    return func.lower(column).like(term)
+
+def _to_float(val):
+    try:
+        if val is None:
+            return None
+        if isinstance(val, (int, float)):
+            return float(val)
+        s = str(val).strip().replace(",", ".")
+        return float(s) if s != "" else None
+    except Exception:
+        return None
+
+def _safe_valor_presente(valor_mensal, meses_restantes, indice_anual):
+    # Backlog = VM * MR quando não houver taxa (mantém compat com cálculos existentes)
+    vm = _to_float(valor_mensal) or 0.0
+    mr = int(meses_restantes or 0)
+    taxa = _to_float(indice_anual)
+    if not taxa or taxa <= 0:
+        return round(vm * mr, 2)
+    try:
+        vp = calc_valor_presente(vm, mr, taxa)
+        if (vp is None) or (vp == 0 and vm > 0 and mr > 0):
+            return round(vm * mr, 2)
+        return round(float(vp), 2)
+    except Exception:
+        return round(vm * mr, 2)
+
+def _is_retornado(item) -> bool:
+    if hasattr(item, "status"):
+        st = getattr(item, "status", None)
+        if isinstance(st, str) and st.strip().upper() == "RETORNADO":
+            return True
+    if hasattr(item, "data_retorno"):
+        dr = getattr(item, "data_retorno", None)
+        if dr is not None and str(dr).strip() != "":
+            return True
+    return False
+
+def _apply_filtros(q, cliente: str | None, contrato: str | None, ativo: str | None):
+    if cliente and hasattr(Contrato, "nome_cli"):
+        q = q.filter(_ilike_ci(Contrato.nome_cli, cliente))
+    if contrato:
+        _, col = _pick_attr(Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato")
+        if col is None:
+            col = cast(getattr(Contrato, "cabecalho_id"), String())
+        q = q.filter(_ilike_ci(col, contrato))
+    if ativo and hasattr(Contrato, "ativo"):
+        q = q.filter(_ilike_ci(Contrato.ativo, ativo))
+    return q
+
+def _filtrar_apenas_em_carteira(q, db: Session):
+    # Preferência por colunas do item
+    if hasattr(Contrato, "status") or hasattr(Contrato, "data_retorno"):
+        conds = []
+        if hasattr(Contrato, "status"):
+            conds.append(or_(Contrato.status.is_(None), func.upper(Contrato.status) != "RETORNADO"))
+        if hasattr(Contrato, "data_retorno"):
+            conds.append(or_(Contrato.data_retorno.is_(None), cast(Contrato.data_retorno, String) == ""))
+        if conds:
+            from sqlalchemy import and_ as _and
+            return q.filter(_and(*conds))
+
+    # Fallback via último log != RETORNO
+    if not ContratoLog:
+        return q
+
+    join_keys = []
+    if hasattr(ContratoLog, "ativo") and hasattr(Contrato, "ativo"):
+        join_keys.append(ContratoLog.ativo == Contrato.ativo)
+    if hasattr(ContratoLog, "cod_cli") and hasattr(Contrato, "cod_cli"):
+        join_keys.append(ContratoLog.cod_cli == Contrato.cod_cli)
+    if hasattr(ContratoLog, "contrato_num") and hasattr(Contrato, "contrato_num"):
+        join_keys.append(ContratoLog.contrato_num == Contrato.contrato_num)
+    if not join_keys:
+        return q
+
+    date_col = None
+    for c in ("data_mov", "data", "created_at", "timestamp"):
+        if hasattr(ContratoLog, c):
+            date_col = getattr(ContratoLog, c)
+            break
+    if date_col is None:
+        return q
+
+    keys = []
+    if hasattr(ContratoLog, "contrato_num"): keys.append(ContratoLog.contrato_num)
+    if hasattr(ContratoLog, "ativo"):        keys.append(ContratoLog.ativo)
+    if hasattr(ContratoLog, "cod_cli"):      keys.append(ContratoLog.cod_cli)
+
+    sub = (
+        db.query(*(k.label(f"k{i}") for i, k in enumerate(keys)), func.max(date_col).label("last_dt"))
+        .group_by(*keys)
+    ).subquery("lasts")
+
+    from sqlalchemy.orm import aliased
+    L = aliased(ContratoLog)
+    join_conds = []
+    if hasattr(ContratoLog, "contrato_num"):
+        join_conds.append(L.contrato_num == (sub.c.k0 if "k0" in sub.c else L.contrato_num))
+    if hasattr(ContratoLog, "ativo"):
+        if "k1" in sub.c: join_conds.append(L.ativo == sub.c.k1)
+        elif "k0" in sub.c: join_conds.append(L.ativo == sub.c.k0)
+    if hasattr(ContratoLog, "cod_cli"):
+        for k in ("k2", "k1", "k0"):
+            if k in sub.c:
+                join_conds.append(L.cod_cli == sub.c[k])
+                break
+    join_conds.append(L.__table__.c[date_col.key] == sub.c.last_dt)
+
+    q = (
+        q.join(
+            sub,
+            and_(
+                (Contrato.contrato_num == sub.c.k0) if "k0" in sub.c and hasattr(Contrato, "contrato_num") else True,
+                (Contrato.ativo == sub.c.k1) if "k1" in sub.c and hasattr(Contrato, "ativo") else True,
+                (Contrato.cod_cli == sub.c.k2) if "k2" in sub.c and hasattr(Contrato, "cod_cli") else True,
+            )
+        )
+        .join(L, and_(*join_conds))
+        .filter(L.tp_transacao != "RETORNO")
+    )
+    return q
+
+def _template_response(context: dict):
+    for name in ["contratos_lista.html", "contratos.html", "contratos_list.html"]:
+        try:
+            templates.env.get_template(name)
+            return templates.TemplateResponse(name, context)
+        except TemplateNotFound:
+            continue
+    raise HTTPException(500, detail="Templates não encontrados: contratos_lista.html, contratos.html ou contratos_list.html")
+
+def _tune_sqlite(db: Session):
+    """Aplica PRAGMAs amigáveis a batch sem mexer no engine global."""
+    try:
+        db.execute(text("PRAGMA journal_mode=WAL"))
+    except Exception:
+        pass
+    try:
+        db.execute(text("PRAGMA busy_timeout=60000"))  # 60s
+    except Exception:
+        pass
+
+def _is_locked(exc: Exception) -> bool:
+    return "database is locked" in str(exc).lower()
+
+# ------------------ LISTAGEM HTML ------------------
+
+@router.get("")
+def contratos_view(
+    request: Request,
+    db: Session = Depends(get_db),
+    cliente: str | None = Query(default=None),
+    contrato: str | None = Query(default=None),
+    ativo: str | None = Query(default=None),
+    incluir_retornados: bool = Query(default=False),
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=25, ge=5, le=200),
+    order_by: str = Query(default="data_envio"),
+    order_dir: str = Query(default="desc"),
+):
+    # 1) Query base + filtros
+    q_base = db.query(Contrato)
+    q_base = _apply_filtros(q_base, cliente, contrato, ativo)
+    usar_carteira = not incluir_retornados
+    if usar_carteira:
+        q_base = _filtrar_apenas_em_carteira(q_base, db)
+
+    total = q_base.count()
+
+    # 2) Ordenação + paginação
+    col = getattr(Contrato, order_by, None)
+    if col is None:
+        for name in ("data_envio", "id", "nome_cli", "ativo"):
+            col = getattr(Contrato, name, None)
+            if col is not None:
+                break
+    q_rows = q_base.order_by(desc(col) if str(order_dir).lower() == "desc" else asc(col))
+    offset = (page - 1) * per_page
+    rows = q_rows.offset(offset).limit(per_page).all()
+
+    # 3) Se não achou nada “em carteira”, refaz incluindo retornados
+    usando_retornados = False
+    if total == 0 and usar_carteira:
+        q_base = db.query(Contrato)
+        q_base = _apply_filtros(q_base, cliente, contrato, ativo)
+        total = q_base.count()
+        q_rows = q_base.order_by(desc(col) if str(order_dir).lower() == "desc" else asc(col))
+        rows = q_rows.offset(offset).limit(per_page).all()
+        usando_retornados = True
+        incluir_retornados = True  # refletir no contexto
+
+    # 4) Agregados SEM cartesian product
+    sq = q_base.with_entities(
+        cast(Contrato.valor_mensal, Numeric).label("vm"),
+        cast(Contrato.meses_restantes, Numeric).label("mr"),
+    ).subquery()
+
+    valor_mensal_sum = db.query(func.coalesce(func.sum(sq.c.vm), 0)).scalar() or 0
+    backlog_sum = db.query(func.coalesce(func.sum(sq.c.vm * sq.c.mr), 0)).scalar() or 0
+
+    # 5) Contexto — inclui aliases legados para templates antigos
+    ctx = {
+        "request": request,
+        "rows": rows,
+        "contratos": rows,           # compat com contratos_lista.html antigo
+        "itens": rows,               # outro alias comum
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "order_by": order_by,
+        "order_dir": order_dir,
+        "cliente": cliente or "",
+        "contrato": contrato or "",
+        "ativo": ativo or "",
+        "incluir_retornados": incluir_retornados,
+        "incluirRetornados": incluir_retornados,  # camelCase
+        "usando_retornados": usando_retornados,   # para aviso no template (se houver)
+        "valor_mensal_sum": float(valor_mensal_sum),
+        "backlog_sum": float(backlog_sum),
+        # extras legados
+        "valor_mensal_total": float(valor_mensal_sum),
+        "backlog_total": float(backlog_sum),
+    }
+    return _template_response(ctx)
+
+# ------------------ EXPORTAÇÃO ------------------
+
+@router.get("/export")
+def exportar_contratos(
+    db: Session = Depends(get_db),
+    fmt: str = Query("csv", description="csv|xlsx"),
+    cliente: str | None = None,
+    contrato: str | None = None,
+    ativo: str | None = None,
+    incluir_retornados: bool = False,
+    order_by: str = "data_envio",
+    order_dir: str = "desc",
+    limit: int = Query(50000, ge=1, le=200000),
+):
+    q = db.query(Contrato)
+    q = _apply_filtros(q, cliente, contrato, ativo)
+    if not incluir_retornados:
+        q = _filtrar_apenas_em_carteira(q, db)
+
+    col = getattr(Contrato, order_by, None)
+    if col is None:
+        col = getattr(Contrato, "data_envio", None) or getattr(Contrato, "id")
+    q = q.order_by(desc(col) if str(order_dir).lower() == "desc" else asc(col)).limit(limit)
+
+    def _row(c: Contrato):
+        contrato_num = getattr(c, "contrato_num", getattr(c, "contrato_n", None))
+        data_envio = getattr(c, "data_envio", None)
+        vm = float(getattr(c, "valor_mensal", 0) or 0)
+        mr = int(getattr(c, "meses_restantes", 0) or 0)
+        return {
+            "Ativo": getattr(c, "ativo", None),
+            "Cliente": getattr(c, "nome_cli", None),
+            "CodCliente": getattr(c, "cod_cli", None),
+            "Contrato": contrato_num,
+            "DataEnvio": str(data_envio) if data_envio else "",
+            "ValorMensal": vm,
+            "MesesRestantes": mr,
+            "Backlog": round(vm * mr, 2),
+        }
+
+    rows = [_row(c) for c in q.all()]
+    headers = list(rows[0].keys()) if rows else ["Ativo","Cliente","CodCliente","Contrato","DataEnvio","ValorMensal","MesesRestantes","Backlog"]
+
+    if fmt.lower() == "xlsx":
+        try:
+            from openpyxl import Workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Contratos"
+            ws.append(headers)
+            for r in rows:
+                ws.append([r.get(h) for h in headers])
+            bio = BytesIO()
+            wb.save(bio)
+            bio.seek(0)
+            return StreamingResponse(
+                bio,
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": 'attachment; filename="contratos.xlsx"'}
+            )
+        except Exception:
+            # cai no CSV
+            pass
+
+    sio = StringIO()
+    sio.write(";".join(headers) + "\n")
+    for r in rows:
+        vals = [str(r.get(h, "")) for h in headers]
+        sio.write(";".join(vals) + "\n")
+    sio.seek(0)
+    return StreamingResponse(
+        sio,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="contratos.csv"'}
+    )
+
+# ------------------ SINCRONIZAÇÕES ------------------
 
 @router.post("/sincronizar/{contrato_num}")
 def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depends(get_db)):
-    """
-    Sincroniza e recalcula apenas um contrato (identificado por contrato_num).
-    """
-    # Cabeçalho: aceita contrato_n, contrato_num, numero, numero_contrato
-    _, cab_num_col = _pick_attr(ContratoCabecalho, "contrato_n", "contrato_num", "numero", "numero_contrato")
+    contrato_num = (contrato_num or "").strip()
+
+    cab_num_name, cab_num_col = _pick_attr(
+        ContratoCabecalho, "contrato_n", "contrato_num", "numero", "numero_contrato"
+    )
     if cab_num_col is None:
-        raise HTTPException(500, detail="ContratoCabecalho sem coluna de número (tente: contrato_n/contrato_num/numero).")
+        raise HTTPException(500, detail="ContratoCabecalho sem coluna de número.")
 
     cab = db.query(ContratoCabecalho).filter(cab_num_col == contrato_num).first()
     if not cab:
         raise HTTPException(404, detail=f"Cabeçalho do contrato {contrato_num} não encontrado.")
 
-    # Pega prazo (tenta 'prazo_contratual' e cai para 'periodo_contratual')
-    prazo = getattr(cab, "prazo_contratual", None)
-    if prazo is None:
-        prazo = getattr(cab, "periodo_contratual", None)
-
+    prazo = getattr(cab, "prazo_contratual", None) or getattr(cab, "periodo_contratual", None)
     indice_anual = getattr(cab, "indice_reajuste", None)
+    cab_cod_cli = getattr(cab, "cod_cli", None)
 
-    # Itens: aceita contrato_n, contrato_num, numero, numero_contrato
-    _, item_num_col = _pick_attr(Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato")
+    item_num_name, item_num_col = _pick_attr(
+        Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato"
+    )
     if item_num_col is None:
-        raise HTTPException(500, detail="Contrato (itens) sem coluna de número (tente: contrato_n/contrato_num/numero).")
+        raise HTTPException(500, detail="Contrato (itens) sem coluna de número.")
 
     itens = db.query(Contrato).filter(item_num_col == contrato_num).all()
+    itens = [it for it in itens if not _is_retornado(it)]
+
     if not itens:
         url = request.headers.get("referer") or "/contratos"
         return RedirectResponse(url=f"{url}?ok=0&msg=sem_itens", status_code=303)
 
     atualizados = 0
+    copiados_cod_cli = 0
+
     for it in itens:
-        # Se existir 'periodo_contratual' no item e houver prazo no cabeçalho, copie
+        if hasattr(it, "cod_cli") and cab_cod_cli and getattr(it, "cod_cli", None) != cab_cod_cli:
+            it.cod_cli = cab_cod_cli
+            copiados_cod_cli += 1
+
         if hasattr(it, "periodo_contratual") and prazo is not None:
             it.periodo_contratual = prazo
 
-        # período para cálculo
         periodo = getattr(it, "periodo_contratual", None) or prazo or 0
-
-        # data de início: tenta várias opções
         data_inicio = getattr(it, "data_envio", None) or getattr(it, "data_inicio", None) or getattr(it, "data", None)
-
-        # valor mensal
         valor_mensal = getattr(it, "valor_mensal", 0.0)
 
-        # recalcular
         it.meses_restantes = calc_meses_restantes(data_inicio, int(periodo or 0))
         it.valor_global_contrato = calc_valor_global(valor_mensal, int(periodo or 0))
-        it.valor_presente_contrato = calc_valor_presente(valor_mensal, it.meses_restantes, indice_anual)
+        it.valor_presente_contrato = _safe_valor_presente(valor_mensal, it.meses_restantes, indice_anual)
 
         atualizados += 1
 
     db.commit()
-
     url = request.headers.get("referer") or f"/contratos/{contrato_num}"
-    return RedirectResponse(url=f"{url}?ok=1&n={atualizados}", status_code=303)
+    return RedirectResponse(url=f"{url}?ok=1&n={atualizados}&codcli={copiados_cod_cli}", status_code=303)
 
 
 @router.post("/sincronizar")
 def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
     """
-    Sincroniza e recalcula TODOS os contratos em lote.
-    - Copia período do cabeçalho (se existir no item) e recalcula campos derivados.
-    - Continua mesmo se algum item falhar (contabiliza erros).
+    Batch robusto: WAL + busy_timeout + retries e rollback garantido.
+    Mantém semântica de retorno via redirect com querystring.
     """
-    # Descobrir colunas de chave/atributos de cabeçalho e item
-    cab_num_name, cab_num_col = _pick_attr(ContratoCabecalho, "contrato_n", "contrato_num", "numero", "numero_contrato")
+    _tune_sqlite(db)
+
+    # rollback inicial para garantir transação limpa
+    try:
+        db.rollback()
+    except Exception:
+        pass
+
+    # ---- mapeia cabeçalhos (em transação curta, com retries p/ lock) ----
+    cab_num_name, cab_num_col = _pick_attr(
+        ContratoCabecalho, "contrato_n", "contrato_num", "numero", "numero_contrato"
+    )
     if cab_num_col is None:
-        raise HTTPException(500, detail="ContratoCabecalho sem coluna de número (tente: contrato_n/contrato_num/numero).")
+        raise HTTPException(500, detail="ContratoCabecalho sem coluna de número.")
 
     prazo_name = "prazo_contratual" if hasattr(ContratoCabecalho, "prazo_contratual") else (
-                 "periodo_contratual" if hasattr(ContratoCabecalho, "periodo_contratual") else None)
+        "periodo_contratual" if hasattr(ContratoCabecalho, "periodo_contratual") else None
+    )
     indice_name = "indice_reajuste" if hasattr(ContratoCabecalho, "indice_reajuste") else None
+    codcli_header_exists = hasattr(ContratoCabecalho, "cod_cli")
+    codcli_item_exists = hasattr(Contrato, "cod_cli")
 
-    item_num_name, item_num_col = _pick_attr(Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato")
-    if item_num_col is None:
-        raise HTTPException(500, detail="Contrato (itens) sem coluna de número (tente: contrato_n/contrato_num/numero).")
-
-    # Mapa de cabeçalhos: numero (str) -> (prazo, indice)
     header_map = {}
-    for cab in db.query(ContratoCabecalho).all():
-        num = getattr(cab, cab_num_name)
-        key = str(num) if num is not None else None
-        if key is None:
-            continue
-        prazo = getattr(cab, prazo_name, None) if prazo_name else None
-        indice = getattr(cab, indice_name, None) if indice_name else None
-        header_map[key] = (prazo, indice)
+    for tent in range(6):
+        try:
+            for cab in db.query(ContratoCabecalho).yield_per(500):
+                num = getattr(cab, cab_num_name)
+                key = str(num).strip() if num is not None else None
+                if not key:
+                    continue
+                prazo = getattr(cab, prazo_name, None) if prazo_name else None
+                indice = getattr(cab, indice_name, None) if indice_name else None
+                codcli = getattr(cab, "cod_cli", None) if codcli_header_exists else None
+                header_map[key] = (prazo, indice, codcli)
+            break
+        except Exception as e:
+            if _is_locked(e):
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                time.sleep(0.3 * (2 ** tent))
+                _tune_sqlite(db)
+                continue
+            raise
 
-    # Percorrer itens em lote e recalcular
+    # ---- percorre itens com commits parciais e retries ----
+    item_num_name, item_num_col = _pick_attr(
+        Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato"
+    )
+    if item_num_col is None:
+        raise HTTPException(500, detail="Contrato (itens) sem coluna de número.")
+
     atualizados = 0
     pulados_sem_cab = 0
+    pulados_retornado = 0
+    copiados_cod_cli = 0
     erros = 0
 
     batch_size = 500
+    processed = 0
+
     q = db.query(Contrato)
 
-    # yield_per reduz uso de memória e melhora throughput em coleções grandes
-    for idx, it in enumerate(q.yield_per(batch_size), start=1):
+    for it in q.yield_per(batch_size):
         try:
+            if _is_retornado(it):
+                pulados_retornado += 1
+                continue
+
             num_val = getattr(it, item_num_name)
-            dados = header_map.get(str(num_val))
+            dados = header_map.get(str(num_val).strip() if num_val is not None else "")
             if not dados:
                 pulados_sem_cab += 1
                 continue
 
-            prazo, indice_anual = dados
+            prazo, indice_anual, cab_cod_cli = dados
 
-            # copiar período para item (se existir a coluna)
             if hasattr(it, "periodo_contratual") and prazo is not None:
                 it.periodo_contratual = prazo
+
+            if codcli_item_exists and cab_cod_cli and getattr(it, "cod_cli", None) != cab_cod_cli:
+                it.cod_cli = cab_cod_cli
+                copiados_cod_cli += 1
 
             periodo = getattr(it, "periodo_contratual", None) or prazo or 0
             data_inicio = getattr(it, "data_envio", None) or getattr(it, "data_inicio", None) or getattr(it, "data", None)
@@ -153,23 +510,80 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
 
             it.meses_restantes = calc_meses_restantes(data_inicio, int(periodo or 0))
             it.valor_global_contrato = calc_valor_global(valor_mensal, int(periodo or 0))
-            it.valor_presente_contrato = calc_valor_presente(valor_mensal, it.meses_restantes, indice_anual)
+            it.valor_presente_contrato = _safe_valor_presente(
+                valor_mensal, it.meses_restantes, indice_anual
+            )
 
             atualizados += 1
+            processed += 1
 
-            # commits parciais para não segurar a transação por muito tempo
-            if idx % batch_size == 0:
-                db.flush()
-                db.commit()
-        except Exception:
-            # contabiliza erro e segue para o próximo item
+            # commit parcial por batch, com retry para lock
+            if processed % batch_size == 0:
+                for tent in range(4):
+                    try:
+                        db.flush()
+                        db.commit()
+                        break
+                    except Exception as e:
+                        if _is_locked(e):
+                            try:
+                                db.rollback()
+                            except Exception:
+                                pass
+                            time.sleep(0.25 * (tent + 1))
+                            _tune_sqlite(db)
+                            continue
+                        else:
+                            try:
+                                db.rollback()
+                            except Exception:
+                                pass
+                            erros += 1
+                            break
+
+        except Exception as e:
+            # qualquer falha no item atual: rollback e continua
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            if _is_locked(e):
+                # pequena espera e segue (próximo item)
+                time.sleep(0.1)
             erros += 1
 
-    db.commit()
+    # commit final com retry
+    for tent in range(4):
+        try:
+            db.flush()
+            db.commit()
+            break
+        except Exception as e:
+            if _is_locked(e):
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                time.sleep(0.25 * (tent + 1))
+                _tune_sqlite(db)
+                continue
+            else:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                erros += 1
+                break
 
     url = request.headers.get("referer") or "/contratos"
-    # Exibe contadores na UI (alert no template)
     return RedirectResponse(
-        url=f"{url}?ok=1&n={atualizados}&skip={pulados_sem_cab}&err={erros}",
-        status_code=303
+        url=(
+            f"{url}?ok=1"
+            f"&n={atualizados}"
+            f"&skip_sem_cab={pulados_sem_cab}"
+            f"&skip_ret={pulados_retornado}"
+            f"&codcli={copiados_cod_cli}"
+            f"&err={erros}"
+        ),
+        status_code=303,
     )

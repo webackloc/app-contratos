@@ -19,11 +19,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
+
 from database import SessionLocal
 from auth_models import User
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
-templates = Jinja2Templates(directory="templates")
+
 
 
 # ---------------- banco ----------------
@@ -227,7 +228,7 @@ async def users_list(request: Request, db: Session = Depends(get_db)):
     require_admin(request, db)
     users = db.query(User).order_by(_order_attr()).all()
     return templates.TemplateResponse(
-        "admin/users_list.html",
+        "Admin/users_list.html",
         {
             "request": request,
             "users": users,
