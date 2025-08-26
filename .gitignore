@@ -1,24 +1,17 @@
-# SO/IDE
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
-
 # Python
 __pycache__/
 *.py[cod]
-*.egg-info/
 .venv/
 venv/
 
-# Artefatos do app
-runtime/
+# Logs / DB locais
+*.log
 *.db
 *.db.bak*
 *.sqlite*
-*.log
+runtime/
 
-# Temporários / backups
+# Temp do app
 temp_*.csv
 popular_codcli_backup_*.csv
 services/movimentacao_service.back.txt
