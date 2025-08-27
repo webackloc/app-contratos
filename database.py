@@ -1,19 +1,19 @@
 # database.py
 # -----------------------------------------------------------------------------
-# Versão: 2.0.0 (2025-08-21)
-# Mudanças principais:
-# - Mantém compatibilidade com PRODUÇÃO via variável de ambiente (DATABASE_URL / APP_DB_URL / SQLALCHEMY_DATABASE_URL),
-#   normalizando "postgres://" -> "postgresql://".
-# - Em DESENVOLVIMENTO (sem env var), faz fallback para **SQLite local** em caminho ABSOLUTO, usando
-#   o arquivo **contratos.db** na pasta do projeto (evita erro "unable to open database file" no Windows).
-# - Pool conservador para Postgres (NullPool + pre_ping) e `check_same_thread=False` para SQLite.
-# - Expõe `Base = declarative_base()` para uso nos models.
+# Versão: 2.1.0 (2025-08-27)
+# Mudanças:
+# - Força o uso do driver psycopg2 para Postgres (evita psycopg v3).
+# - Adiciona sslmode=require automaticamente para hosts do Render.
+# - Habilita pre_ping e keepalives para reduzir "the connection is closed".
+# - Mantém fallback para SQLite local em desenvolvimento.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.pool import NullPool
@@ -23,14 +23,42 @@ Base = declarative_base()
 
 
 def _normalize_db_url(url: str | None) -> str | None:
-    """Normaliza esquemas antigos do Postgres ("postgres://") para "postgresql://".
-    Não altera URLs vazias ou SQLite.
-    """
+    """Normaliza 'postgres://' -> 'postgresql://'.
+    Não altera URLs vazias ou SQLite."""
     if not url:
         return url
     url = url.strip()
     if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql://", 1)
+        url = url.replace("postgres://", "postgresql://", 1)
+    return url
+
+
+def _force_psycopg2_and_ssl(url: str) -> str:
+    """
+    Se a URL for Postgres, força o dialecto 'postgresql+psycopg2://'
+    e acrescenta 'sslmode=require' quando o host é do Render e
+    o parâmetro não está presente.
+    """
+    parsed = urlparse(url)
+
+    # Só toca se for postgres
+    if parsed.scheme.startswith("postgresql"):
+        # força driver psycopg2
+        scheme = "postgresql+psycopg2"
+
+        # reconstrói netloc/params sem mexer em user:pass@host:port
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+
+        host_is_render = isinstance(parsed.hostname, str) and "render.com" in parsed.hostname
+        if host_is_render and "sslmode" not in {k.lower(): v for k, v in query.items()}:
+            query["sslmode"] = "require"
+
+        new = parsed._replace(
+            scheme=scheme,
+            query=urlencode(query),
+        )
+        return urlunparse(new)
+
     return url
 
 
@@ -43,9 +71,12 @@ DATABASE_URL = (
 DATABASE_URL = _normalize_db_url(DATABASE_URL)
 
 if not DATABASE_URL:
-    # Fallback de DEV: arquivo contratos.db na pasta do projeto, com caminho ABSOLUTO
+    # Fallback de DEV: arquivo contratos.db na pasta do projeto, caminho ABSOLUTO
     db_path = (Path(__file__).resolve().parent / "contratos.db").resolve()
     DATABASE_URL = f"sqlite+pysqlite:///{db_path.as_posix()}"
+else:
+    # Produção: força psycopg2 e sslmode=require p/ Render
+    DATABASE_URL = _force_psycopg2_and_ssl(DATABASE_URL)
 
 # 2) Parâmetros específicos por driver
 connect_args: dict = {}
@@ -55,9 +86,25 @@ if DATABASE_URL.startswith("sqlite"):
     # SQLite precisa desse parâmetro quando usado em apps web (threads)
     connect_args = {"check_same_thread": False}
 else:
-    # Em Postgres/serviços gerenciados, evite pool agressivo e habilite pre_ping
+    # Postgres em serviços gerenciados (Render):
+    #  - NullPool: sem conexões quentes entre requests (robusto p/ ambientes serverless)
+    #  - pre_ping: valida conexão antes de usar (evita "connection is closed")
+    #  - keepalives: reduz quedas de conexão durante streams/yield_per
     engine_kwargs["poolclass"] = NullPool
     engine_kwargs["pool_pre_ping"] = True
+    # Opções libpq (psycopg2) de keepalive:
+    connect_args.update({
+        # habilita keepalive
+        "keepalives": 1,
+        # segundos de inatividade antes de enviar keepalive
+        "keepalives_idle": 30,
+        # intervalo entre pacotes de keepalive
+        "keepalives_interval": 10,
+        # tentativas antes de considerar a conexão morta
+        "keepalives_count": 5,
+        # opcional: etiqueta a conexão
+        "application_name": os.getenv("RENDER_SERVICE_NAME", "app-contratos"),
+    })
 
 # 3) Cria o engine
 engine = create_engine(
