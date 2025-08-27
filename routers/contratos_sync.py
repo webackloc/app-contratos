@@ -1,27 +1,28 @@
 # =============================================================================
 # routers/contratos_sync.py
-# Versão: v2.2.0 (2025-08-26)
-# O que mudou nesta versão:
-#   • Batch sync mais robusto:
-#       - PRAGMA journal_mode=WAL + busy_timeout (sem alterar o engine global)
-#       - rollback() garantido antes de novos commits (evita PendingRollbackError)
-#       - retries leves para "database is locked" em listagem e commits parciais
-#   • Mantidos recursos da v2.1.3:
-#       - Compat: aliases de contexto ('contratos', 'itens', incluirRetornados)
-#       - Fallback de template (contratos_lista.html → contratos.html → contratos_list.html)
-#       - Filtros por cliente/contrato/ativo; paginação/ordenação
-#       - Agregações via subquery (evita cartesian product)
+# Versão: v2.3.0 (2025-08-27)
+#
+# Novidades v2.3.0:
+#   • Batch sync robusto no Postgres:
+#       - Usa DUAS sessões: leitor (streaming c/ yield_per) e escritor (commits).
+#       - Evita fechar o cursor de streaming ao dar commit (antes acontecia no mesmo Session).
+#   • Mantém recursos das versões anteriores:
+#       - Filtros (cliente/contrato/ativo), paginação/ordenação
+#       - Agregações sem produto cartesiano
 #       - Export CSV/XLSX
+#       - Aliases de contexto e fallback de templates
+#       - Cálculo de meses_restantes / valor_global / valor_presente
+#       - Cópia de cod_cli do cabeçalho para itens
 # =============================================================================
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from starlette.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func, cast, Numeric, String, desc, asc, and_, or_, text
+from sqlalchemy import func, cast, Numeric, String, desc, asc, and_, or_, text, select
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateNotFound
 
-from database import get_db
+from database import get_db, SessionLocal  # <- usamos SessionLocal para sessões separadas (leitura/escrita)
 from models import Contrato, ContratoCabecalho
 try:
     from models import ContratoLog  # opcional
@@ -32,7 +33,6 @@ from utils.recalculo_contratos import (
     calc_meses_restantes, calc_valor_global, calc_valor_presente
 )
 from io import StringIO, BytesIO
-import logging
 import time
 
 templates = Jinja2Templates(directory="templates")
@@ -65,7 +65,7 @@ def _to_float(val):
         return None
 
 def _safe_valor_presente(valor_mensal, meses_restantes, indice_anual):
-    # Backlog = VM * MR quando não houver taxa (mantém compat com cálculos existentes)
+    # Backlog = VM * MR quando não houver taxa (compat com cálculos existentes)
     vm = _to_float(valor_mensal) or 0.0
     mr = int(meses_restantes or 0)
     taxa = _to_float(indice_anual)
@@ -116,16 +116,6 @@ def _filtrar_apenas_em_carteira(q, db: Session):
 
     # Fallback via último log != RETORNO
     if not ContratoLog:
-        return q
-
-    join_keys = []
-    if hasattr(ContratoLog, "ativo") and hasattr(Contrato, "ativo"):
-        join_keys.append(ContratoLog.ativo == Contrato.ativo)
-    if hasattr(ContratoLog, "cod_cli") and hasattr(Contrato, "cod_cli"):
-        join_keys.append(ContratoLog.cod_cli == Contrato.cod_cli)
-    if hasattr(ContratoLog, "contrato_num") and hasattr(Contrato, "contrato_num"):
-        join_keys.append(ContratoLog.contrato_num == Contrato.contrato_num)
-    if not join_keys:
         return q
 
     date_col = None
@@ -339,8 +329,7 @@ def exportar_contratos(
                 headers={"Content-Disposition": 'attachment; filename="contratos.xlsx"'}
             )
         except Exception:
-            # cai no CSV
-            pass
+            pass  # fallback CSV
 
     sio = StringIO()
     sio.write(";".join(headers) + "\n")
@@ -416,174 +405,132 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
 @router.post("/sincronizar")
 def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
     """
-    Batch robusto: WAL + busy_timeout + retries e rollback garantido.
-    Mantém semântica de retorno via redirect com querystring.
+    Batch robusto: DUAS sessões (leitura/escrita) para evitar fechar o cursor
+    de streaming ao dar commit. Mantém retorno via redirect com querystring.
     """
-    _tune_sqlite(db)
-
-    # rollback inicial para garantir transação limpa
+    # --------- Sessão de LEITURA (streaming) ---------
+    db_read = SessionLocal()
     try:
-        db.rollback()
-    except Exception:
-        pass
+        # 1) Mapear cabeçalhos (número → (prazo, índice, cod_cli))
+        cab_num_name, cab_num_col = _pick_attr(
+            ContratoCabecalho, "contrato_n", "contrato_num", "numero", "numero_contrato"
+        )
+        if cab_num_col is None:
+            raise HTTPException(500, detail="ContratoCabecalho sem coluna de número.")
 
-    # ---- mapeia cabeçalhos (em transação curta, com retries p/ lock) ----
-    cab_num_name, cab_num_col = _pick_attr(
-        ContratoCabecalho, "contrato_n", "contrato_num", "numero", "numero_contrato"
-    )
-    if cab_num_col is None:
-        raise HTTPException(500, detail="ContratoCabecalho sem coluna de número.")
+        prazo_name = "prazo_contratual" if hasattr(ContratoCabecalho, "prazo_contratual") else (
+            "periodo_contratual" if hasattr(ContratoCabecalho, "periodo_contratual") else None
+        )
+        indice_name = "indice_reajuste" if hasattr(ContratoCabecalho, "indice_reajuste") else None
+        codcli_header_exists = hasattr(ContratoCabecalho, "cod_cli")
+        codcli_item_exists = hasattr(Contrato, "cod_cli")
 
-    prazo_name = "prazo_contratual" if hasattr(ContratoCabecalho, "prazo_contratual") else (
-        "periodo_contratual" if hasattr(ContratoCabecalho, "periodo_contratual") else None
-    )
-    indice_name = "indice_reajuste" if hasattr(ContratoCabecalho, "indice_reajuste") else None
-    codcli_header_exists = hasattr(ContratoCabecalho, "cod_cli")
-    codcli_item_exists = hasattr(Contrato, "cod_cli")
-
-    header_map = {}
-    for tent in range(6):
-        try:
-            for cab in db.query(ContratoCabecalho).yield_per(500):
-                num = getattr(cab, cab_num_name)
-                key = str(num).strip() if num is not None else None
-                if not key:
-                    continue
-                prazo = getattr(cab, prazo_name, None) if prazo_name else None
-                indice = getattr(cab, indice_name, None) if indice_name else None
-                codcli = getattr(cab, "cod_cli", None) if codcli_header_exists else None
-                header_map[key] = (prazo, indice, codcli)
-            break
-        except Exception as e:
-            if _is_locked(e):
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-                time.sleep(0.3 * (2 ** tent))
-                _tune_sqlite(db)
+        header_map: dict[str, tuple[int | None, float | None, str | None]] = {}
+        for cab in db_read.query(ContratoCabecalho).yield_per(500):
+            num = getattr(cab, cab_num_name)
+            key = str(num).strip() if num is not None else None
+            if not key:
                 continue
-            raise
+            prazo = getattr(cab, prazo_name, None) if prazo_name else None
+            indice = getattr(cab, indice_name, None) if indice_name else None
+            codcli = getattr(cab, "cod_cli", None) if codcli_header_exists else None
+            header_map[key] = (prazo, indice, codcli)
 
-    # ---- percorre itens com commits parciais e retries ----
-    item_num_name, item_num_col = _pick_attr(
-        Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato"
-    )
-    if item_num_col is None:
-        raise HTTPException(500, detail="Contrato (itens) sem coluna de número.")
+        # 2) Iterar IDs dos itens via streaming (NÃO dar commit nesta sessão)
+        batch_size = 500
+        id_stream = (
+            db_read.execute(
+                select(Contrato.id).execution_options(stream_results=True)
+            ).scalars().yield_per(batch_size)
+        )
 
-    atualizados = 0
-    pulados_sem_cab = 0
-    pulados_retornado = 0
-    copiados_cod_cli = 0
-    erros = 0
+        # --------- Sessão de ESCRITA (commits por lote) ---------
+        atualizados = 0
+        pulados_sem_cab = 0
+        pulados_retornado = 0
+        copiados_cod_cli = 0
+        erros = 0
 
-    batch_size = 500
-    processed = 0
+        buffer_ids = []
 
-    q = db.query(Contrato)
-
-    for it in q.yield_per(batch_size):
-        try:
-            if _is_retornado(it):
-                pulados_retornado += 1
-                continue
-
-            num_val = getattr(it, item_num_name)
-            dados = header_map.get(str(num_val).strip() if num_val is not None else "")
-            if not dados:
-                pulados_sem_cab += 1
-                continue
-
-            prazo, indice_anual, cab_cod_cli = dados
-
-            if hasattr(it, "periodo_contratual") and prazo is not None:
-                it.periodo_contratual = prazo
-
-            if codcli_item_exists and cab_cod_cli and getattr(it, "cod_cli", None) != cab_cod_cli:
-                it.cod_cli = cab_cod_cli
-                copiados_cod_cli += 1
-
-            periodo = getattr(it, "periodo_contratual", None) or prazo or 0
-            data_inicio = getattr(it, "data_envio", None) or getattr(it, "data_inicio", None) or getattr(it, "data", None)
-            valor_mensal = getattr(it, "valor_mensal", 0.0)
-
-            it.meses_restantes = calc_meses_restantes(data_inicio, int(periodo or 0))
-            it.valor_global_contrato = calc_valor_global(valor_mensal, int(periodo or 0))
-            it.valor_presente_contrato = _safe_valor_presente(
-                valor_mensal, it.meses_restantes, indice_anual
-            )
-
-            atualizados += 1
-            processed += 1
-
-            # commit parcial por batch, com retry para lock
-            if processed % batch_size == 0:
-                for tent in range(4):
-                    try:
-                        db.flush()
-                        db.commit()
-                        break
-                    except Exception as e:
-                        if _is_locked(e):
-                            try:
-                                db.rollback()
-                            except Exception:
-                                pass
-                            time.sleep(0.25 * (tent + 1))
-                            _tune_sqlite(db)
-                            continue
-                        else:
-                            try:
-                                db.rollback()
-                            except Exception:
-                                pass
-                            erros += 1
-                            break
-
-        except Exception as e:
-            # qualquer falha no item atual: rollback e continua
+        def processar_lote(ids: list[int]):
+            nonlocal atualizados, pulados_sem_cab, pulados_retornado, copiados_cod_cli, erros
+            if not ids:
+                return
+            db_write = SessionLocal()
             try:
-                db.rollback()
-            except Exception:
-                pass
-            if _is_locked(e):
-                # pequena espera e segue (próximo item)
-                time.sleep(0.1)
-            erros += 1
+                # Ajuste SQLite local (inofensivo no Postgres)
+                _tune_sqlite(db_write)
 
-    # commit final com retry
-    for tent in range(4):
-        try:
-            db.flush()
-            db.commit()
-            break
-        except Exception as e:
-            if _is_locked(e):
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-                time.sleep(0.25 * (tent + 1))
-                _tune_sqlite(db)
-                continue
-            else:
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
+                itens = db_write.query(Contrato).filter(Contrato.id.in_(ids)).all()
+                for it in itens:
+                    try:
+                        if _is_retornado(it):
+                            pulados_retornado += 1
+                            continue
+
+                        # número do item
+                        item_num_name, _ = _pick_attr(Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato")
+                        num_val = getattr(it, item_num_name)
+                        dados = header_map.get(str(num_val).strip() if num_val is not None else "")
+                        if not dados:
+                            pulados_sem_cab += 1
+                            continue
+
+                        prazo, indice_anual, cab_cod_cli = dados
+
+                        if hasattr(it, "periodo_contratual") and prazo is not None:
+                            it.periodo_contratual = prazo
+
+                        if codcli_item_exists and cab_cod_cli and getattr(it, "cod_cli", None) != cab_cod_cli:
+                            it.cod_cli = cab_cod_cli
+                            copiados_cod_cli += 1
+
+                        periodo = getattr(it, "periodo_contratual", None) or prazo or 0
+                        data_inicio = getattr(it, "data_envio", None) or getattr(it, "data_inicio", None) or getattr(it, "data", None)
+                        valor_mensal = getattr(it, "valor_mensal", 0.0)
+
+                        it.meses_restantes = calc_meses_restantes(data_inicio, int(periodo or 0))
+                        it.valor_global_contrato = calc_valor_global(valor_mensal, int(periodo or 0))
+                        it.valor_presente_contrato = _safe_valor_presente(
+                            valor_mensal, it.meses_restantes, indice_anual
+                        )
+
+                        atualizados += 1
+                    except Exception:
+                        erros += 1
+                        db_write.rollback()
+                # commit do lote
+                db_write.flush()
+                db_write.commit()
+            except Exception:
                 erros += 1
-                break
+                try:
+                    db_write.rollback()
+                except Exception:
+                    pass
+            finally:
+                db_write.close()
+
+        for _id in id_stream:
+            buffer_ids.append(int(_id))
+            if len(buffer_ids) >= batch_size:
+                processar_lote(buffer_ids)
+                buffer_ids = []
+
+        # resto
+        processar_lote(buffer_ids)
+
+    finally:
+        db_read.close()
 
     url = request.headers.get("referer") or "/contratos"
     return RedirectResponse(
-        url=(
-            f"{url}?ok=1"
-            f"&n={atualizados}"
-            f"&skip_sem_cab={pulados_sem_cab}"
-            f"&skip_ret={pulados_retornado}"
-            f"&codcli={copiados_cod_cli}"
-            f"&err={erros}"
-        ),
+        url=(f"{url}?ok=1"
+             f"&n={atualizados}"
+             f"&skip_sem_cab={pulados_sem_cab}"
+             f"&skip_ret={pulados_retornado}"
+             f"&codcli={copiados_cod_cli}"
+             f"&err={erros}"),
         status_code=303,
     )
