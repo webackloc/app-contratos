@@ -1,16 +1,14 @@
 # services/movimentacao_service.py
-# Versão: 4.2.2 (2025-08-21)
+# Versão: 4.3.0 (2025-08-27)
 # Novidades desta versão:
-# - TROCA por duas linhas (mesma OS): usa coluna "Tipo de Movimento Troca" para
-#   distinguir ENVIO/RETORNO e pareia corretamente, evitando inversões.
-# - RETORNO fecha o item correto (status="RETORNADO", data_retorno=data_mov).
-# - ENVIO herda data_envio do item que retornou e grava data_troca=data_mov.
-# - Idempotência por mov_hash com reprocesso quando o estado atual exigir.
+# - Garante que **o número do contrato** também seja gravado no item (se existir um campo compatível no modelo).
+# - Período do contrato herdado do cabeçalho ainda mais robusto:
+#   - copia datas (início/fim) para múltiplas variações de nomes de coluna no item;
+#   - copia "periodo" textual, "prazo_contratual", "meses_contrato" ou "tempo_contrato" (se existirem no item).
+# - Mantém idempotência por mov_hash e reaplica somente quando necessário.
 # - Sem mudanças de schema.
 #
-# Histórico:
-# 4.2.1: período herdado do cabeçalho; hashes distintos para TROCA-ENVIO/TROCA-RETORNO.
-# 4.1.x: compat com SQLite (batch) e colunas opcionais.
+# Histórico: ver 4.2.x nas versões anteriores.
 
 from __future__ import annotations
 
@@ -149,7 +147,7 @@ def _get_periodo_from_cab(cab: ContratoCabecalho) -> tuple[date | None, date | N
     ini_d = _parse_date(ini)
     fim_d = _parse_date(fim)
     if not fim_d:
-        prazo = _pick_attr(cab, "prazo_contratual", "prazo", "meses_contrato")
+        prazo = _pick_attr(cab, "prazo_contratual", "prazo", "meses_contrato", "tempo_contrato")
         if ini_d and prazo is not None:
             try:
                 fim_d = _add_months(ini_d, int(prazo))
@@ -159,8 +157,14 @@ def _get_periodo_from_cab(cab: ContratoCabecalho) -> tuple[date | None, date | N
 
 def _set_periodo_on_item(item: Contrato, ini: date | None, fim: date | None):
     """Aplica periodo_inicio/periodo_fim nos nomes existentes do modelo de item."""
-    ini_targets = ("periodo_inicio", "vigencia_inicio", "dt_inicio", "competencia_inicio")
-    fim_targets = ("periodo_fim", "vigencia_fim", "dt_fim", "competencia_fim")
+    ini_targets = (
+        "periodo_inicio", "vigencia_inicio", "dt_inicio", "competencia_inicio",
+        "inicio_vigencia", "inicio_contrato",
+    )
+    fim_targets = (
+        "periodo_fim", "vigencia_fim", "dt_fim", "competencia_fim",
+        "fim_vigencia", "fim_contrato",
+    )
     if ini:
         for t in ini_targets:
             if hasattr(item, t):
@@ -269,6 +273,38 @@ def _require_cabecalho(sess: Session, contrato_num: str, cod_cli: Optional[str])
         raise ValueError(f"Cabeçalho não encontrado para contrato='{contrato_num}'." + extra)
     return cab
 
+# --------- helpers: número do contrato ----------------------------
+
+def _extract_contrato_num_from_cab(cab: ContratoCabecalho) -> Optional[str]:
+    for name in [
+        "contrato_num", "contrato_n", "numero", "contrato", "numero_contrato",
+        "num_contrato", "n_contrato", "contratoid",
+    ]:
+        if hasattr(cab, name):
+            v = getattr(cab, name)
+            if v is not None and _as_str(v) != "":
+                return _as_str(v)
+    return None
+
+def _extract_contrato_num_from_row(row: Dict[str, Any]) -> Optional[str]:
+    s = _row_get_str(row, "contrato_num_norm", "contrato_num", "contraton", "contrato", "numero_contrato", "num_contrato", "n_contrato")
+    return s or None
+
+def _apply_contrato_num_on_item(item: Contrato, contrato_num: Optional[str]) -> None:
+    if not contrato_num:
+        return
+    possible_names = [
+        "contrato_num", "contrato_n", "numero_contrato", "num_contrato",
+        "n_contrato", "contrato", "contratoid", "numero",
+    ]
+    for name in possible_names:
+        if hasattr(item, name):
+            try:
+                setattr(item, name, contrato_num)
+                break
+            except Exception:
+                pass
+
 # --------- período (string / meta) a partir do cabeçalho ------------
 
 def _get_attr(obj: Any, *names: str):
@@ -280,32 +316,37 @@ def _get_attr(obj: Any, *names: str):
     return None
 
 def _periodo_fields_from_cab(cab: ContratoCabecalho) -> Dict[str, Any]:
-    """Retém campos 'periodo'/'prazo_contratual'/'indice_reajuste' se existirem no modelo do item."""
+    """Retém campos 'periodo'/'prazo*'/'indice_reajuste' se existirem no modelo do item."""
     out: Dict[str, Any] = {}
     try:
         cols = {attr.key for attr in sa_inspect(Contrato).mapper.column_attrs}
     except Exception:
         cols = set()
 
+    # periodo (texto)
     if "periodo" in cols:
         val = _get_attr(cab, "periodo", "vigencia")
         if not val:
-            ini = _get_attr(cab, "inicio_vigencia", "vigencia_inicio", "inicio")
-            fim = _get_attr(cab, "fim_vigencia", "vigencia_fim", "fim")
+            ini = _get_attr(cab, "inicio_vigencia", "vigencia_inicio", "inicio", "periodo_inicio", "dt_inicio")
+            fim = _get_attr(cab, "fim_vigencia", "vigencia_fim", "fim", "periodo_fim", "dt_fim")
             if ini or fim:
                 val = f"{_as_str(ini)} a {_as_str(fim)}".strip()
         if not val:
-            meses = _get_attr(cab, "prazo_contratual")
+            meses = _get_attr(cab, "prazo_contratual", "meses_contrato", "tempo_contrato", "prazo")
             if meses is not None:
                 val = f"{meses}m"
         if val:
             out["periodo"] = _as_str(val)
 
-    if "prazo_contratual" in cols:
-        pc = _get_attr(cab, "prazo_contratual")
-        if pc is not None:
-            out["prazo_contratual"] = pc
+    # prazo numérico
+    prazo_val = _get_attr(cab, "prazo_contratual", "meses_contrato", "tempo_contrato", "prazo")
+    if prazo_val is not None:
+        for cand in ["prazo_contratual", "meses_contrato", "tempo_contrato"]:
+            if cand in cols and cand not in out:
+                out[cand] = prazo_val
+                break
 
+    # índice de reajuste
     if "indice_reajuste" in cols:
         ir = _get_attr(cab, "indice_reajuste")
         if ir is not None:
@@ -401,6 +442,9 @@ def _envio(
     # valor_mensal do arquivo
     valor_mensal_val = _row_get_valor_mensal(row)
 
+    # tentar obter o número do contrato a ser gravado no item
+    contrato_num_str = _extract_contrato_num_from_row(row) or _extract_contrato_num_from_cab(cab)
+
     raw_kwargs = dict(
         cabecalho_id=cab.id,
         ativo=row["ativo"],
@@ -430,6 +474,9 @@ def _envio(
 
     item = Contrato(**item_kwargs)
 
+    # Número do contrato gravado diretamente no item (quando o modelo tiver a coluna)
+    _apply_contrato_num_on_item(item, contrato_num_str)
+
     # Período “de/até” (datas) copiado do cabeçalho, se os campos existirem no item
     ini, fim = _get_periodo_from_cab(cab)
     _set_periodo_on_item(item, ini, fim)
@@ -457,7 +504,7 @@ def _retorno(sess: Session, row: Dict[str, Any], cab: ContratoCabecalho, data_mo
 # ----------------------- leitura canônica row ----------------------
 
 def _canon(row: Dict[str, Any]) -> Dict[str, Any]:
-    contrato_num = row.get("contrato_num_norm") or _row_get_str(row, "contrato_num", "contraton", "contrato")
+    contrato_num = row.get("contrato_num_norm") or _row_get_str(row, "contrato_num", "contraton", "contrato", "numero_contrato", "num_contrato", "n_contrato")
     cod_cli = row.get("cod_cli_norm") or _row_get_str(row, "cod_cli", "cliente", "cod_cliente")
     ativo = row.get("ativo_norm") or _row_get_str(row, "ativo", "patrimonio", "equipamento", "serial")
     data_raw = row.get("data_mov_iso") or _row_get_str(row, "data_mov", "data", "data_movimento")
