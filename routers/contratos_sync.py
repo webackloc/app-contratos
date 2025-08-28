@@ -1,20 +1,18 @@
 # =============================================================================
 # routers/contratos_sync.py
-# Versão: v2.4.7 (2025-08-28)
+# Versão: v2.4.9 (2025-08-28)
 #
-# Objetivo desta versão
-# - Diagnóstico claro: endpoint /contratos/_diag e opção JSON em /sincronizar.
-# - Log de versão ao carregar para confirmar que este arquivo está ativo.
-# - Aliases de campos ampliados (inclui 'meses_restante').
-# - SAVEPOINT por item, paginação por PK, logs de erros em runtime/sync_errors.jsonl.
-# - Params úteis: debug=1 (adiciona err_types), json=1 (retorna JSON), force=1 (marca changed=True para todos os itens válidos).
+# O que mudou da v2.4.7:
+# - Fallback de template na listagem (contratos_lista.html -> contratos.html -> contratos_list.html)
+# - Contexto completo garantido para o template (total/page/per_page/order_by/order_dir/incluir_retornados/KPIs)
+# - Mantido todo o resto (/_diag, json=1, force=1, aliases ampliados, batch com SAVEPOINT, logs)
 # =============================================================================
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
 from starlette.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func, cast, Numeric, String, desc, asc, and_, or_, text
+from sqlalchemy import func, cast, Numeric, String, desc, asc, or_, text
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateNotFound
 
@@ -33,10 +31,9 @@ from datetime import datetime, date
 import json, os, logging
 
 # --------- versão/log ---------
-VERSION = "v2.4.7"
+VERSION = "v2.4.9"
 log = logging.getLogger("uvicorn.error")
 log.info("[contratos_sync] carregado %s", VERSION)
-
 
 templates = Jinja2Templates(directory="templates")
 router = APIRouter(tags=["Contratos"])
@@ -91,7 +88,6 @@ def _parse_date_any(d):
     except Exception:
         return None
 
-
 def _safe_valor_presente(valor_mensal, meses_restantes, indice_anual):
     vm = _to_float(valor_mensal) or 0.0
     mr = int(meses_restantes or 0)
@@ -104,7 +100,6 @@ def _safe_valor_presente(valor_mensal, meses_restantes, indice_anual):
     except Exception:
         return round(vm * mr, 2)
 
-
 def _is_retornado(item) -> bool:
     if hasattr(item, "status"):
         st = getattr(item, "status", None)
@@ -115,7 +110,6 @@ def _is_retornado(item) -> bool:
         if dr is not None and str(dr).strip() != "":
             return True
     return False
-
 
 def _apply_filtros(q, cliente: str | None, contrato: str | None, ativo: str | None):
     if cliente and hasattr(Contrato, "nome_cli"):
@@ -130,16 +124,21 @@ def _apply_filtros(q, cliente: str | None, contrato: str | None, ativo: str | No
         q = q.filter(_ilike_ci(Contrato.ativo, ativo))
     return q
 
-
 def _tune_sqlite(db: Session):
-    try:
-        db.execute(text("PRAGMA journal_mode=WAL"))
-    except Exception:
-        pass
-    try:
-        db.execute(text("PRAGMA busy_timeout=60000"))
-    except Exception:
-        pass
+    try: db.execute(text("PRAGMA journal_mode=WAL"))
+    except Exception: pass
+    try: db.execute(text("PRAGMA busy_timeout=60000"))
+    except Exception: pass
+
+# --------- Fallback de template ---------
+def _template_response(ctx: dict):
+    for name in ["contratos_lista.html", "contratos.html", "contratos_list.html"]:
+        try:
+            templates.env.get_template(name)
+            return templates.TemplateResponse(name, ctx)
+        except TemplateNotFound:
+            continue
+    raise HTTPException(500, detail="Templates não encontrados: contratos_lista.html/contratos.html/contratos_list.html")
 
 # ------------------ LISTAGEM HTML ------------------
 
@@ -159,7 +158,6 @@ def contratos_view(
     q_base = db.query(Contrato)
     q_base = _apply_filtros(q_base, cliente, contrato, ativo)
     if not incluir_retornados:
-        # Usando somente itens em carteira quando possível
         if hasattr(Contrato, "status"):
             q_base = q_base.filter(or_(Contrato.status.is_(None), func.upper(Contrato.status) != "RETORNADO"))
         if hasattr(Contrato, "data_retorno"):
@@ -178,13 +176,14 @@ def contratos_view(
     rows = q_rows.offset(offset).limit(per_page).all()
 
     # KPIs da lista
+    mr_colname = _first_existing_name(Contrato, ["meses_restantes","meses_rest","meses_restante"]) or "meses_restantes"
     sq = q_base.with_entities(
         cast(Contrato.valor_mensal, Numeric).label("vm"),
-        cast(getattr(Contrato, _first_existing_name(Contrato, ["meses_restantes","meses_rest"]) or "meses_restantes"), Numeric).label("mr"),
+        cast(getattr(Contrato, mr_colname), Numeric).label("mr"),
     ).subquery()
 
-    valor_mensal_sum = db.query(func.coalesce(func.sum(sq.c.vm), 0)).scalar() or 0
-    backlog_sum = db.query(func.coalesce(func.sum(sq.c.vm * sq.c.mr), 0)).scalar() or 0
+    valor_mensal_sum = float(db.query(func.coalesce(func.sum(sq.c.vm), 0)).scalar() or 0)
+    backlog_sum = float(db.query(func.coalesce(func.sum(sq.c.vm * sq.c.mr), 0)).scalar() or 0)
 
     ctx = {
         "request": request,
@@ -200,12 +199,12 @@ def contratos_view(
         "contrato": contrato or "",
         "ativo": ativo or "",
         "incluir_retornados": incluir_retornados,
-        "valor_mensal_sum": float(valor_mensal_sum),
-        "backlog_sum": float(backlog_sum),
-        "valor_mensal_total": float(valor_mensal_sum),
-        "backlog_total": float(backlog_sum),
+        "valor_mensal_sum": valor_mensal_sum,
+        "backlog_sum": backlog_sum,
+        "valor_mensal_total": valor_mensal_sum,
+        "backlog_total": backlog_sum,
     }
-    return templates.TemplateResponse("contratos_lista.html", ctx)
+    return _template_response(ctx)
 
 # ------------------ DIAGNÓSTICO ------------------
 
@@ -275,11 +274,8 @@ def exportar_contratos(
             ws = wb.active
             ws.title = "Contratos"
             ws.append(headers)
-            for r in rows:
-                ws.append([r.get(h) for h in headers])
-            bio = BytesIO()
-            wb.save(bio)
-            bio.seek(0)
+            for r in rows: ws.append([r.get(h) for h in headers])
+            bio = BytesIO(); wb.save(bio); bio.seek(0)
             return StreamingResponse(
                 bio,
                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -360,7 +356,6 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
         except Exception:
             mr = 0
 
-        # definir nos primeiros nomes existentes
         mr_name = _first_existing_name(Contrato, mr_aliases)
         vg_name = _first_existing_name(Contrato, vg_aliases)
         vp_name = _first_existing_name(Contrato, vp_aliases)
@@ -392,7 +387,6 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
 
     db.commit()
 
-    # resposta
     if request.query_params.get("json") in {"1","true","True"} or request.query_params.get("format") == "json":
         return JSONResponse({
             "version": VERSION,
@@ -406,7 +400,6 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
     url = request.headers.get("referer") or f"/contratos/{contrato_num}"
     return RedirectResponse(url=f"{url}?ok=1&n={atualizados}&inalterados={inalterados}", status_code=303)
 
-
 @router.post("/sincronizar")
 def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
     """Batch robusto compatível com variações de esquema.
@@ -416,7 +409,6 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
     as_json = request.query_params.get("json") in {"1", "true", "True"} or request.query_params.get("format") == "json"
     force = request.query_params.get("force") in {"1","true","True"}
 
-    # --------- Sessão de LEITURA ---------
     db_read = SessionLocal()
     try:
         cab_num_name, cab_num_col = _pick_attr(
@@ -550,10 +542,8 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                 db_write.commit()
             except Exception as e:
                 log_error(e.__class__.__name__, str(e), None)
-                try:
-                    db_write.rollback()
-                except Exception:
-                    pass
+                try: db_write.rollback()
+                except Exception: pass
             finally:
                 db_write.close()
 
@@ -581,7 +571,6 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
     finally:
         db_read.close()
 
-    # Saída
     payload = {
         "version": VERSION,
         "dest": {"mr": mr_name, "vg": vg_name, "vp": vp_name},
