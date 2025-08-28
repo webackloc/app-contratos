@@ -1,20 +1,15 @@
 # =============================================================================
 # routers/contratos_sync.py
-# Versão: v2.4.2 (2025-08-28)
+# Versão: v2.4.3 (2025-08-28)
 #
-# Mudanças v2.4.2:
-#   • Corrige strings quebradas no bloco de exportação CSV e no log JSONL.
-#   • Pequena robustez em _apply_filtros (fallback para cabecalho_id/id).
-#   • Mantém todas as melhorias da v2.4.1 (SAVEPOINT por item, debug=1, etc.).
-#
-# Mudanças v2.4.1:
-#   • SAVEPOINT por item (begin_nested) para não derrubar o lote inteiro.
-#   • Loga amostras de erro em runtime/sync_errors.jsonl.
-#   • Cálculos tolerantes para datas e valores.
-#
-# Mudanças v2.4.0 (base):
-#   • Removido streaming server-side; paginação por PK (id > last_id LIMIT N).
-#   • Sessões separadas: leitura e escrita por lote.
+# Mudanças v2.4.3:
+#   • Compatibilidade de campos calculados: detecta dinamicamente os nomes
+#     existentes no modelo para Valor Global e Valor Presente
+#     (ex.: valor_global_contrato | valor_global | valor_global_total, etc.).
+#     Evita AttributeError e garante atualização mesmo com esquemas diferentes.
+#   • Contadores adicionais: skip_campos (itens sem colunas de destino) e
+#     n_inalterados (itens em que os valores já estavam iguais).
+#   • Mantém SAVEPOINT por item, logs em JSONL e paginação por PK.
 # =============================================================================
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
@@ -118,7 +113,6 @@ def _apply_filtros(q, cliente: str | None, contrato: str | None, ativo: str | No
     if contrato:
         _, col = _pick_attr(Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato")
         if col is None:
-            # fallback seguro: tenta cabecalho_id, senão id
             fallback = getattr(Contrato, "cabecalho_id", getattr(Contrato, "id"))
             col = cast(fallback, String())
         q = q.filter(_ilike_ci(col, contrato))
@@ -311,7 +305,9 @@ def exportar_contratos(
         contrato_num = getattr(c, "contrato_num", getattr(c, "contrato_n", None))
         data_envio = getattr(c, "data_envio", None)
         vm = float(getattr(c, "valor_mensal", 0) or 0)
-        mr = int(getattr(c, "meses_restantes", 0) or 0)
+        # meses_restantes pode não existir em alguns esquemas
+        mr_name, _ = _pick_attr(Contrato, "meses_restantes", "meses_rest")
+        mr = int(getattr(c, mr_name, 0) or 0) if mr_name else 0
         return {
             "Ativo": getattr(c, "ativo", None),
             "Cliente": getattr(c, "nome_cli", None),
@@ -384,6 +380,11 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
     if item_num_col is None:
         raise HTTPException(500, detail="Contrato (itens) sem coluna de número.")
 
+    # Campos destino compatíveis
+    mr_name, _ = _pick_attr(Contrato, "meses_restantes", "meses_rest")
+    vg_name, _ = _pick_attr(Contrato, "valor_global_contrato", "valor_global", "valor_global_total", "valor_total")
+    vp_name, _ = _pick_attr(Contrato, "valor_presente_contrato", "valor_presente", "valor_presente_total", "valor_presente_backlog")
+
     itens = db.query(Contrato).filter(item_num_col == contrato_num).all()
     itens = [it for it in itens if not _is_retornado(it)]
 
@@ -392,12 +393,10 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
         return RedirectResponse(url=f"{url}?ok=0&msg=sem_itens", status_code=303)
 
     atualizados = 0
-    copiados_cod_cli = 0
 
     for it in itens:
         if hasattr(it, "cod_cli") and cab_cod_cli and getattr(it, "cod_cli", None) != cab_cod_cli:
             it.cod_cli = cab_cod_cli
-            copiados_cod_cli += 1
 
         if hasattr(it, "periodo_contratual") and prazo is not None:
             it.periodo_contratual = prazo
@@ -412,24 +411,38 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
             mr = calc_meses_restantes(data_inicio, int(periodo or 0)) if data_inicio else 0
         except Exception:
             mr = 0
-        it.meses_restantes = int(mr or 0)
-        it.valor_global_contrato = calc_valor_global(valor_mensal, int(periodo or 0))
-        it.valor_presente_contrato = _safe_valor_presente(valor_mensal, it.meses_restantes, indice_anual)
 
-        atualizados += 1
+        changed = False
+        if mr_name:
+            prev = getattr(it, mr_name, None)
+            newv = int(mr or 0)
+            if prev != newv:
+                setattr(it, mr_name, newv)
+                changed = True
+        if vg_name:
+            prev = getattr(it, vg_name, None)
+            newv = calc_valor_global(valor_mensal, int(periodo or 0))
+            if prev != newv:
+                setattr(it, vg_name, newv)
+                changed = True
+        if vp_name:
+            prev = getattr(it, vp_name, None)
+            newv = _safe_valor_presente(valor_mensal, int(mr or 0), indice_anual)
+            if prev != newv:
+                setattr(it, vp_name, newv)
+                changed = True
+
+        if changed:
+            atualizados += 1
 
     db.commit()
     url = request.headers.get("referer") or f"/contratos/{contrato_num}"
-    return RedirectResponse(url=f"{url}?ok=1&n={atualizados}&codcli={copiados_cod_cli}", status_code=303)
+    return RedirectResponse(url=f"{url}?ok=1&n={atualizados}", status_code=303)
 
 
 @router.post("/sincronizar")
 def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
-    """Batch robusto sem server-side cursor.
-    - Paginação por PK (id > last_id LIMIT N)
-    - Transação por item via SAVEPOINT (begin_nested), para que erros não derrubem o lote.
-    - Loga amostras de erros em runtime/sync_errors.jsonl
-    """
+    """Batch robusto sem server-side cursor e compatível com variações de esquema."""
     debug = request.query_params.get("debug") in {"1", "true", "True"}
 
     # --------- Sessão de LEITURA ---------
@@ -460,13 +473,19 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
             codcli = getattr(cab, "cod_cli", None) if codcli_header_exists else None
             header_map[key] = (prazo, indice, codcli)
 
-        # 2) Paginação
+        # 2) Descobrir campos destino uma vez
+        mr_name, _ = _pick_attr(Contrato, "meses_restantes", "meses_rest")
+        vg_name, _ = _pick_attr(Contrato, "valor_global_contrato", "valor_global", "valor_global_total", "valor_total")
+        vp_name, _ = _pick_attr(Contrato, "valor_presente_contrato", "valor_presente", "valor_presente_total", "valor_presente_backlog")
+
         batch_size = 500
         atualizados = 0
         pulados_sem_cab = 0
         pulados_retornado = 0
         copiados_cod_cli = 0
         erros = 0
+        skip_campos = 0
+        n_inalterados = 0
         err_types: dict[str, int] = {}
         err_samples = []
 
@@ -480,7 +499,7 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                 err_samples.append({"id": item_id, "kind": kind, "msg": msg[:300]})
 
         def processar_lote(ids: list[int]):
-            nonlocal atualizados, pulados_sem_cab, pulados_retornado, copiados_cod_cli
+            nonlocal atualizados, pulados_sem_cab, pulados_retornado, copiados_cod_cli, skip_campos, n_inalterados
             if not ids:
                 return
             db_write = SessionLocal()
@@ -506,7 +525,7 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                     prazo, indice_anual, cab_cod_cli = dados
 
                     try:
-                        with db_write.begin_nested():  # SAVEPOINT por item
+                        with db_write.begin_nested():
                             if hasattr(it, "periodo_contratual") and prazo is not None:
                                 it.periodo_contratual = prazo
 
@@ -525,12 +544,34 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                             except Exception:
                                 mr = 0
 
-                            it.meses_restantes = int(mr or 0)
-                            it.valor_global_contrato = calc_valor_global(valor_mensal, int(periodo or 0))
-                            it.valor_presente_contrato = _safe_valor_presente(valor_mensal, it.meses_restantes, indice_anual)
+                            if not any([mr_name, vg_name, vp_name]):
+                                skip_campos += 1
+                            else:
+                                changed = False
+                                if mr_name:
+                                    prev = getattr(it, mr_name, None)
+                                    newv = int(mr or 0)
+                                    if prev != newv:
+                                        setattr(it, mr_name, newv)
+                                        changed = True
+                                if vg_name:
+                                    prev = getattr(it, vg_name, None)
+                                    newv = calc_valor_global(valor_mensal, int(periodo or 0))
+                                    if prev != newv:
+                                        setattr(it, vg_name, newv)
+                                        changed = True
+                                if vp_name:
+                                    prev = getattr(it, vp_name, None)
+                                    newv = _safe_valor_presente(valor_mensal, int(mr or 0), indice_anual)
+                                    if prev != newv:
+                                        setattr(it, vp_name, newv)
+                                        changed = True
 
-                            db_write.flush()  # dentro do savepoint
-                            atualizados += 1
+                                if changed:
+                                    db_write.flush()
+                                    atualizados += 1
+                                else:
+                                    n_inalterados += 1
                     except Exception as e:
                         kind = e.__class__.__name__
                         log_error(kind, str(e), getattr(it, "id", None))
@@ -571,7 +612,7 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
     url = request.headers.get("referer") or "/contratos"
     qp = (
         f"?ok=1&n={atualizados}&skip_sem_cab={pulados_sem_cab}&skip_ret={pulados_retornado}"
-        f"&codcli={copiados_cod_cli}&err={erros}"
+        f"&codcli={copiados_cod_cli}&err={erros}&skip_campos={skip_campos}&inalterados={n_inalterados}"
     )
     if debug and erros:
         err_types_str = ",".join(f"{k}:{v}" for k, v in sorted(err_types.items()))
