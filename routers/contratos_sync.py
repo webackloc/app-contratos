@@ -1,12 +1,13 @@
 # =============================================================================
 # routers/contratos_sync.py
-# Versão: v2.4.11 (2025-08-28)
+# Versão: v2.4.12 (2025-08-28)
 #
-# Objetivo: facilitar o DEBUG no ambiente produtivo sem DevTools/Console.
-# - Mantém tudo da v2.4.10 (_to_int seguro, fallback de template, /_diag, json=1, force=1, etc.)
-# - NOVO: GET /contratos/sincronizar_debug  → executa o batch e retorna JSON (sem precisar usar POST)
-# - NOVO: GET /contratos/sincronizar_dry    → prévia (não escreve no banco), mostra o que SERIA atualizado
-# - Loga no servidor um resumo dos erros quando errors>0
+# Hotfix de robustez de execução e debug rápido:
+# - Timebox do batch: max_seconds e max_batches por chamada (resposta sempre rápida)
+# - Ponto de retomada: start_id e next_start_id
+# - Stall guard do cursor (evita laço infinito se o id não avança)
+# - Endpoints de debug/dry com parâmetros
+# - Mantém todos os comportamentos da v2.4.11 (aliases, _to_int seguro, /_diag, export, etc.)
 # =============================================================================
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
@@ -28,9 +29,9 @@ from utils.recalculo_contratos import (
 )
 from io import StringIO, BytesIO
 from datetime import datetime, date
-import json, os, logging, re
+import json, os, logging, re, time
 
-VERSION = "v2.4.11"
+VERSION = "v2.4.12"
 log = logging.getLogger("uvicorn.error")
 log.info("[contratos_sync] carregado %s", VERSION)
 
@@ -305,9 +306,10 @@ def exportar_contratos(
         headers={"Content-Disposition": 'attachment; filename="contratos.csv"'}
     )
 
-# ------------------ Núcleo comum do batch ------------------
+# ------------------ Núcleo comum do batch (timeboxed) ------------------
 
-def _run_batch(force: bool, dry: bool, debug: bool):
+def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_seconds: int, max_batches: int):
+    t0 = time.monotonic()
     db_read = SessionLocal()
     try:
         cab_num_name, cab_num_col = _pick_attr(
@@ -353,7 +355,10 @@ def _run_batch(force: bool, dry: bool, debug: bool):
         err_types: dict[str, int] = {}
         err_samples = []
 
-        last_id = 0
+        last_id = int(max(0, start_id or 0))
+        batches_done = 0
+        partial = False
+        cursor_stall = False
 
         def log_error(kind: str, msg: str, item_id: int | None):
             nonlocal erros
@@ -368,7 +373,12 @@ def _run_batch(force: bool, dry: bool, debug: bool):
                 return
             db_write = SessionLocal()
             try:
-                db_write.execute(text("PRAGMA journal_mode=WAL")) if 'sqlite' in str(db_write.bind.engine.url) else None
+                # otimização leve p/ sqlite somente
+                try:
+                    if 'sqlite' in str(db_write.bind.engine.url):
+                        db_write.execute(text("PRAGMA journal_mode=WAL"))
+                except Exception:
+                    pass
                 itens = db_write.query(Contrato).filter(Contrato.id.in_(ids)).all()
                 for it in itens:
                     if _is_retornado(it):
@@ -473,6 +483,13 @@ def _run_batch(force: bool, dry: bool, debug: bool):
                 db_write.close()
 
         while True:
+            if max_seconds > 0 and (time.monotonic() - t0) >= max_seconds:
+                partial = True
+                break
+            if max_batches > 0 and batches_done >= max_batches:
+                partial = True
+                break
+
             id_rows = (
                 db_read.query(Contrato.id)
                 .filter(Contrato.id > last_id)
@@ -483,19 +500,29 @@ def _run_batch(force: bool, dry: bool, debug: bool):
             ids = [int(r[0] if isinstance(r, (list, tuple)) else getattr(r, "id", r)) for r in id_rows]
             if not ids:
                 break
+            prev_last_id = last_id
             processar_lote(ids)
             last_id = ids[-1]
+            batches_done += 1
+            if last_id == prev_last_id:
+                cursor_stall = True
+                partial = True
+                break
 
         if err_samples:
-            os.makedirs("runtime", exist_ok=True)
-            with open("runtime/sync_errors.jsonl", "a", encoding="utf-8") as f:
-                for s in err_samples:
-                    s["ts"] = datetime.utcnow().isoformat()
-                    f.write(json.dumps(s, ensure_ascii=False) + "\n")
+            try:
+                os.makedirs("runtime", exist_ok=True)
+                with open("runtime/sync_errors.jsonl", "a", encoding="utf-8") as f:
+                    for s in err_samples:
+                        s["ts"] = datetime.utcnow().isoformat()
+                        f.write(json.dumps(s, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
 
     finally:
         db_read.close()
 
+    elapsed = round(time.monotonic() - t0, 3)
     payload = {
         "version": VERSION,
         "dest": {"mr": mr_name, "vg": vg_name, "vp": vp_name},
@@ -507,13 +534,16 @@ def _run_batch(force: bool, dry: bool, debug: bool):
         "skip_campos": skip_campos,
         "copiados_cod_cli": copiados_cod_cli,
         "errors": erros,
+        "err_types": err_types if debug and err_types else None,
+        "error_samples": err_samples if debug and err_samples else None,
+        "partial": partial,
+        "cursor_stall": cursor_stall,
+        "next_start_id": last_id,
+        "batches_done": batches_done,
+        "elapsed_s": elapsed,
+        "limits": {"max_seconds": max_seconds, "max_batches": max_batches, "batch_size": batch_size},
     }
-    if debug:
-        if err_types:
-            payload["err_types"] = err_types
-        if err_samples:
-            payload["error_samples"] = err_samples
-    
+
     if erros:
         log.warning("[contratos_sync][debug] errors=%s types=%s", erros, err_types)
         if err_samples:
@@ -528,8 +558,14 @@ def sincronizar_todos(request: Request):
     debug = request.query_params.get("debug") in {"1", "true", "True"}
     as_json = request.query_params.get("json") in {"1", "true", "True"} or request.query_params.get("format") == "json"
     force = request.query_params.get("force") in {"1","true","True"}
+    start_id = int(request.query_params.get("start_id", 0) or 0)
+    max_seconds = int(request.query_params.get("max_seconds", 20) or 20)
+    max_batches = int(request.query_params.get("max_batches", 20) or 20)
 
-    payload = _run_batch(force=force, dry=False, debug=debug)
+    payload = _run_batch(
+        force=force, dry=False, debug=debug,
+        start_id=start_id, max_seconds=max_seconds, max_batches=max_batches,
+    )
     if as_json:
         return JSONResponse(payload)
 
@@ -537,17 +573,34 @@ def sincronizar_todos(request: Request):
     qp = (
         f"?ok=1&n={payload['updated']}&inalterados={payload['unchanged']}&skip_sem_cab={payload['skip_sem_cab']}"
         f"&skip_ret={payload['skip_ret']}&codcli={payload['copiados_cod_cli']}&skip_campos={payload['skip_campos']}&err={payload['errors']}"
+        f"&partial={'1' if payload.get('partial') else '0'}"
     )
     return RedirectResponse(url + qp, status_code=303)
 
-# NOVO: GET que executa o batch e retorna JSON (sem POST / sem DevTools)
+# GET que executa o batch e retorna JSON (sem POST / sem DevTools)
 @router.get("/sincronizar_debug")
-def sincronizar_debug(force: bool = Query(default=False)):
-    payload = _run_batch(force=bool(force), dry=False, debug=True)
+def sincronizar_debug(
+    force: bool = Query(default=False),
+    start_id: int = Query(default=0, ge=0),
+    max_seconds: int = Query(default=15, ge=1),
+    max_batches: int = Query(default=20, ge=1),
+):
+    payload = _run_batch(
+        force=bool(force), dry=False, debug=True,
+        start_id=int(start_id or 0), max_seconds=int(max_seconds or 15), max_batches=int(max_batches or 20),
+    )
     return JSONResponse(payload)
 
-# NOVO: GET de DRY-RUN (não escreve nada) — mostra o que seria alterado
+# GET de DRY-RUN (não escreve nada) — mostra o que seria alterado
 @router.get("/sincronizar_dry")
-def sincronizar_dry(force: bool = Query(default=False)):
-    payload = _run_batch(force=bool(force), dry=True, debug=True)
+def sincronizar_dry(
+    force: bool = Query(default=False),
+    start_id: int = Query(default=0, ge=0),
+    max_seconds: int = Query(default=15, ge=1),
+    max_batches: int = Query(default=20, ge=1),
+):
+    payload = _run_batch(
+        force=bool(force), dry=True, debug=True,
+        start_id=int(start_id or 0), max_seconds=int(max_seconds or 15), max_batches=int(max_batches or 20),
+    )
     return JSONResponse(payload)
