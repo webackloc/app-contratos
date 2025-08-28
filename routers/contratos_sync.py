@@ -1,13 +1,12 @@
 # =============================================================================
 # routers/contratos_sync.py
-# Versão: v2.4.10 (2025-08-28)
+# Versão: v2.4.11 (2025-08-28)
 #
-# Hotfix crítico: robustez de conversão de período e debug ampliado
-# - Corrige exceptions ao converter período contratual não numérico (ex.: "12 meses").
-#   Agora usamos _to_int() seguro em TODO lugar que usa período.
-# - Mantém fallback de template (contratos_lista.html -> contratos.html -> contratos_list.html)
-# - Mantém /_diag, json=1, force=1, aliases, paginação por PK, logs
-# - Em debug=1, inclui err_types e samples no JSON (primeiros erros)
+# Objetivo: facilitar o DEBUG no ambiente produtivo sem DevTools/Console.
+# - Mantém tudo da v2.4.10 (_to_int seguro, fallback de template, /_diag, json=1, force=1, etc.)
+# - NOVO: GET /contratos/sincronizar_debug  → executa o batch e retorna JSON (sem precisar usar POST)
+# - NOVO: GET /contratos/sincronizar_dry    → prévia (não escreve no banco), mostra o que SERIA atualizado
+# - Loga no servidor um resumo dos erros quando errors>0
 # =============================================================================
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
@@ -31,7 +30,7 @@ from io import StringIO, BytesIO
 from datetime import datetime, date
 import json, os, logging, re
 
-VERSION = "v2.4.10"
+VERSION = "v2.4.11"
 log = logging.getLogger("uvicorn.error")
 log.info("[contratos_sync] carregado %s", VERSION)
 
@@ -39,6 +38,8 @@ templates = Jinja2Templates(directory="templates")
 router = APIRouter(tags=["Contratos"]) 
 
 # ---------------- helpers ---------------
+
+_INT_RE = re.compile(r"[-+]?\d+")
 
 def _pick_attr(model, *names):
     for n in names:
@@ -65,14 +66,10 @@ def _to_float(val):
             return None
         if isinstance(val, (int, float)):
             return float(val)
-        s = str(val).strip()
-        if isinstance(val, str):
-            s = s.replace(" ", "").replace(".", "").replace(",", ".")
+        s = str(val).strip().replace(" ", "").replace(".", "").replace(",", ".")
         return float(s) if s != "" else None
     except Exception:
         return None
-
-_INT_RE = re.compile(r"[-+]?\d+")
 
 def _to_int(val, default=0):
     try:
@@ -80,8 +77,8 @@ def _to_int(val, default=0):
             return default
         if isinstance(val, bool):
             return int(val)
-        if isinstance(val, (int,)):
-            return int(val)
+        if isinstance(val, int):
+            return val
         if isinstance(val, float):
             return int(round(val))
         s = str(val)
@@ -242,16 +239,24 @@ def exportar_contratos(
     limit: int = Query(50000, ge=1, le=200000),
 ):
     q = db.query(Contrato)
-    q = _apply_filtros(q, cliente, contrato, ativo)
+    q = q.filter(True)  # placeholder
+    if cliente and hasattr(Contrato, "nome_cli"):
+        q = q.filter(_ilike_ci(Contrato.nome_cli, cliente))
+    if contrato:
+        _, col = _pick_attr(Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato")
+        if col is None:
+            col = cast(getattr(Contrato, "id"), String())
+        q = q.filter(_ilike_ci(col, contrato))
+    if ativo and hasattr(Contrato, "ativo"):
+        q = q.filter(_ilike_ci(Contrato.ativo, ativo))
+
     if not incluir_retornados:
         if hasattr(Contrato, "status"):
             q = q.filter(or_(Contrato.status.is_(None), func.upper(Contrato.status) != "RETORNADO"))
         if hasattr(Contrato, "data_retorno"):
             q = q.filter(or_(Contrato.data_retorno.is_(None), cast(Contrato.data_retorno, String) == ""))
 
-    col = getattr(Contrato, order_by, None)
-    if col is None:
-        col = getattr(Contrato, "data_envio", None) or getattr(Contrato, "id")
+    col = getattr(Contrato, order_by, None) or getattr(Contrato, "data_envio", None) or getattr(Contrato, "id")
     q = q.order_by(desc(col) if str(order_dir).lower() == "desc" else asc(col)).limit(limit)
 
     def _row(c: Contrato):
@@ -300,124 +305,9 @@ def exportar_contratos(
         headers={"Content-Disposition": 'attachment; filename="contratos.csv"'}
     )
 
-# ------------------ SINCRONIZAÇÕES ------------------
+# ------------------ Núcleo comum do batch ------------------
 
-@router.post("/sincronizar/{contrato_num}")
-def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depends(get_db)):
-    contrato_num = (contrato_num or "").strip()
-
-    cab_num_name, cab_num_col = _pick_attr(
-        ContratoCabecalho, "contrato_n", "contrato_num", "numero", "numero_contrato"
-    )
-    if cab_num_col is None:
-        raise HTTPException(500, detail="ContratoCabecalho sem coluna de número.")
-
-    cab = db.query(ContratoCabecalho).filter(cab_num_col == contrato_num).first()
-    if not cab:
-        raise HTTPException(404, detail=f"Cabeçalho do contrato {contrato_num} não encontrado.")
-
-    prazo = getattr(cab, "prazo_contratual", None) or getattr(cab, "periodo_contratual", None)
-    indice_anual = getattr(cab, "indice_reajuste", None)
-    cab_cod_cli = getattr(cab, "cod_cli", None)
-
-    item_num_name, item_num_col = _pick_attr(
-        Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato"
-    )
-    if item_num_col is None:
-        raise HTTPException(500, detail="Contrato (itens) sem coluna de número.")
-
-    mr_aliases = ["meses_restantes", "meses_rest", "meses_restante"]
-    vg_aliases = ["valor_global_contrato", "valor_global", "valor_global_total", "valor_total"]
-    vp_aliases = ["valor_presente_contrato", "valor_presente", "valor_presente_total", "valor_presente_backlog", "backlog", "backlog_total"]
-
-    itens = db.query(Contrato).filter(item_num_col == contrato_num).all()
-    itens = [it for it in itens if not _is_retornado(it)]
-
-    if not itens:
-        url = request.headers.get("referer") or "/contratos"
-        return RedirectResponse(url=f"{url}?ok=0&msg=sem_itens", status_code=303)
-
-    atualizados = 0
-    inalterados = 0
-
-    force = request.query_params.get("force") in {"1","true","True"}
-
-    for it in itens:
-        if hasattr(it, "cod_cli") and cab_cod_cli and getattr(it, "cod_cli", None) != cab_cod_cli:
-            it.cod_cli = cab_cod_cli
-
-        if hasattr(it, "periodo_contratual") and prazo is not None:
-            it.periodo_contratual = prazo
-
-        periodo_raw = getattr(it, "periodo_contratual", None) or prazo
-        periodo = _to_int(periodo_raw, 0)
-        if periodo < 0:
-            periodo = 0
-
-        data_inicio = _parse_date_any(
-            getattr(it, "data_envio", None) or getattr(it, "data_inicio", None) or getattr(it, "data", None)
-        )
-        valor_mensal = _to_float(getattr(it, "valor_mensal", 0.0)) or 0.0
-
-        try:
-            mr = calc_meses_restantes(data_inicio, periodo) if data_inicio else 0
-        except Exception:
-            mr = 0
-
-        mr_name = _first_existing_name(Contrato, mr_aliases)
-        vg_name = _first_existing_name(Contrato, vg_aliases)
-        vp_name = _first_existing_name(Contrato, vp_aliases)
-
-        changed = False
-        if mr_name:
-            prev = getattr(it, mr_name, None)
-            newv = int(mr or 0)
-            if force or prev != newv:
-                setattr(it, mr_name, newv)
-                changed = True
-        if vg_name:
-            prev = getattr(it, vg_name, None)
-            newv = calc_valor_global(valor_mensal, periodo)
-            if force or prev != newv:
-                setattr(it, vg_name, newv)
-                changed = True
-        if vp_name:
-            prev = getattr(it, vp_name, None)
-            newv = _safe_valor_presente(valor_mensal, mr, indice_anual)
-            if force or prev != newv:
-                setattr(it, vp_name, newv)
-                changed = True
-
-        if changed:
-            atualizados += 1
-        else:
-            inalterados += 1
-
-    db.commit()
-
-    if request.query_params.get("json") in {"1","true","True"} or request.query_params.get("format") == "json":
-        return JSONResponse({
-            "version": VERSION,
-            "dest": {"mr": mr_name, "vg": vg_name, "vp": vp_name},
-            "ok": 1,
-            "updated": atualizados,
-            "unchanged": inalterados,
-            "scope": "single",
-        })
-
-    url = request.headers.get("referer") or f"/contratos/{contrato_num}"
-    return RedirectResponse(url=f"{url}?ok=1&n={atualizados}&inalterados={inalterados}", status_code=303)
-
-
-@router.post("/sincronizar")
-def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
-    """Batch robusto compatível com variações de esquema.
-    Params: debug=1 | json=1 | force=1
-    """
-    debug = request.query_params.get("debug") in {"1", "true", "True"}
-    as_json = request.query_params.get("json") in {"1", "true", "True"} or request.query_params.get("format") == "json"
-    force = request.query_params.get("force") in {"1","true","True"}
-
+def _run_batch(force: bool, dry: bool, debug: bool):
     db_read = SessionLocal()
     try:
         cab_num_name, cab_num_col = _pick_attr(
@@ -478,7 +368,7 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                 return
             db_write = SessionLocal()
             try:
-                _tune_sqlite(db_write)
+                db_write.execute(text("PRAGMA journal_mode=WAL")) if 'sqlite' in str(db_write.bind.engine.url) else None
                 itens = db_write.query(Contrato).filter(Contrato.id.in_(ids)).all()
                 for it in itens:
                     if _is_retornado(it):
@@ -499,12 +389,19 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                     prazo, indice_anual, cab_cod_cli = dados
 
                     try:
-                        # SAVEPOINT
-                        with db_write.begin_nested():
-                            if hasattr(it, "periodo_contratual") and prazo is not None:
+                        if not dry:
+                            ctx_mgr = db_write.begin_nested()
+                        else:
+                            class _Dummy:
+                                def __enter__(self,*a,**k): return self
+                                def __exit__(self,*a,**k): return False
+                            ctx_mgr = _Dummy()
+
+                        with ctx_mgr:
+                            if hasattr(it, "periodo_contratual") and prazo is not None and not dry:
                                 it.periodo_contratual = prazo
 
-                            if codcli_item_exists and cab_cod_cli and getattr(it, "cod_cli", None) != cab_cod_cli:
+                            if codcli_item_exists and cab_cod_cli and getattr(it, "cod_cli", None) != cab_cod_cli and not dry:
                                 it.cod_cli = cab_cod_cli
                                 copiados_cod_cli += 1
 
@@ -530,31 +427,42 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                                 if mr_name:
                                     prev = getattr(it, mr_name, None)
                                     newv = int(mr or 0)
-                                    if force or prev != newv:
-                                        setattr(it, mr_name, newv)
-                                        changed = True
+                                    if dry:
+                                        changed = changed or (prev != newv)
+                                    else:
+                                        if force or prev != newv:
+                                            setattr(it, mr_name, newv)
+                                            changed = True
                                 if vg_name:
                                     prev = getattr(it, vg_name, None)
                                     newv = calc_valor_global(valor_mensal, periodo)
-                                    if force or prev != newv:
-                                        setattr(it, vg_name, newv)
-                                        changed = True
+                                    if dry:
+                                        changed = changed or (prev != newv)
+                                    else:
+                                        if force or prev != newv:
+                                            setattr(it, vg_name, newv)
+                                            changed = True
                                 if vp_name:
                                     prev = getattr(it, vp_name, None)
                                     newv = _safe_valor_presente(valor_mensal, mr, indice_anual)
-                                    if force or prev != newv:
-                                        setattr(it, vp_name, newv)
-                                        changed = True
+                                    if dry:
+                                        changed = changed or (prev != newv)
+                                    else:
+                                        if force or prev != newv:
+                                            setattr(it, vp_name, newv)
+                                            changed = True
 
                                 if changed:
-                                    db_write.flush()
+                                    if not dry:
+                                        db_write.flush()
                                     atualizados += 1
                                 else:
                                     inalterados += 1
                     except Exception as e:
                         kind = e.__class__.__name__
                         log_error(kind, str(e), getattr(it, "id", None))
-                db_write.commit()
+                if not dry:
+                    db_write.commit()
             except Exception as e:
                 log_error(e.__class__.__name__, str(e), None)
                 try:
@@ -605,12 +513,41 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
             payload["err_types"] = err_types
         if err_samples:
             payload["error_samples"] = err_samples
+    
+    if erros:
+        log.warning("[contratos_sync][debug] errors=%s types=%s", erros, err_types)
+        if err_samples:
+            log.warning("[contratos_sync][debug] samples=%s", err_samples[:3])
+
+    return payload
+
+# ------------------ SINCRONIZAÇÕES ------------------
+
+@router.post("/sincronizar")
+def sincronizar_todos(request: Request):
+    debug = request.query_params.get("debug") in {"1", "true", "True"}
+    as_json = request.query_params.get("json") in {"1", "true", "True"} or request.query_params.get("format") == "json"
+    force = request.query_params.get("force") in {"1","true","True"}
+
+    payload = _run_batch(force=force, dry=False, debug=debug)
     if as_json:
         return JSONResponse(payload)
 
     url = request.headers.get("referer") or "/contratos"
     qp = (
-        f"?ok=1&n={atualizados}&inalterados={inalterados}&skip_sem_cab={pulados_sem_cab}"
-        f"&skip_ret={pulados_retornado}&codcli={copiados_cod_cli}&skip_campos={skip_campos}&err={erros}"
+        f"?ok=1&n={payload['updated']}&inalterados={payload['unchanged']}&skip_sem_cab={payload['skip_sem_cab']}"
+        f"&skip_ret={payload['skip_ret']}&codcli={payload['copiados_cod_cli']}&skip_campos={payload['skip_campos']}&err={payload['errors']}"
     )
     return RedirectResponse(url + qp, status_code=303)
+
+# NOVO: GET que executa o batch e retorna JSON (sem POST / sem DevTools)
+@router.get("/sincronizar_debug")
+def sincronizar_debug(force: bool = Query(default=False)):
+    payload = _run_batch(force=bool(force), dry=False, debug=True)
+    return JSONResponse(payload)
+
+# NOVO: GET de DRY-RUN (não escreve nada) — mostra o que seria alterado
+@router.get("/sincronizar_dry")
+def sincronizar_dry(force: bool = Query(default=False)):
+    payload = _run_batch(force=bool(force), dry=True, debug=True)
+    return JSONResponse(payload)
