@@ -1,13 +1,14 @@
 # =============================================================================
 # routers/contratos_sync.py
-# Versão: v2.4.9 (2025-08-28)
+# Versão: v2.4.10 (2025-08-28)
 #
-# O que mudou da v2.4.7:
-# - Fallback de template na listagem (contratos_lista.html -> contratos.html -> contratos_list.html)
-# - Contexto completo garantido para o template (total/page/per_page/order_by/order_dir/incluir_retornados/KPIs)
-# - Mantido todo o resto (/_diag, json=1, force=1, aliases ampliados, batch com SAVEPOINT, logs)
+# Hotfix crítico: robustez de conversão de período e debug ampliado
+# - Corrige exceptions ao converter período contratual não numérico (ex.: "12 meses").
+#   Agora usamos _to_int() seguro em TODO lugar que usa período.
+# - Mantém fallback de template (contratos_lista.html -> contratos.html -> contratos_list.html)
+# - Mantém /_diag, json=1, force=1, aliases, paginação por PK, logs
+# - Em debug=1, inclui err_types e samples no JSON (primeiros erros)
 # =============================================================================
-
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
 from starlette.responses import RedirectResponse, StreamingResponse
@@ -28,17 +29,16 @@ from utils.recalculo_contratos import (
 )
 from io import StringIO, BytesIO
 from datetime import datetime, date
-import json, os, logging
+import json, os, logging, re
 
-# --------- versão/log ---------
-VERSION = "v2.4.9"
+VERSION = "v2.4.10"
 log = logging.getLogger("uvicorn.error")
 log.info("[contratos_sync] carregado %s", VERSION)
 
 templates = Jinja2Templates(directory="templates")
-router = APIRouter(tags=["Contratos"])
+router = APIRouter(tags=["Contratos"]) 
 
-# --------------------- helpers ---------------------
+# ---------------- helpers ---------------
 
 def _pick_attr(model, *names):
     for n in names:
@@ -72,6 +72,26 @@ def _to_float(val):
     except Exception:
         return None
 
+_INT_RE = re.compile(r"[-+]?\d+")
+
+def _to_int(val, default=0):
+    try:
+        if val is None:
+            return default
+        if isinstance(val, bool):
+            return int(val)
+        if isinstance(val, (int,)):
+            return int(val)
+        if isinstance(val, float):
+            return int(round(val))
+        s = str(val)
+        m = _INT_RE.search(s)
+        if not m:
+            return default
+        return int(m.group(0))
+    except Exception:
+        return default
+
 def _parse_date_any(d):
     if d is None or d == "":
         return None
@@ -90,7 +110,9 @@ def _parse_date_any(d):
 
 def _safe_valor_presente(valor_mensal, meses_restantes, indice_anual):
     vm = _to_float(valor_mensal) or 0.0
-    mr = int(meses_restantes or 0)
+    mr = int(_to_int(meses_restantes, 0))
+    if mr < 0:
+        mr = 0
     taxa = _to_float(indice_anual)
     if not taxa or taxa <= 0:
         return round(vm * mr, 2)
@@ -111,36 +133,18 @@ def _is_retornado(item) -> bool:
             return True
     return False
 
-def _apply_filtros(q, cliente: str | None, contrato: str | None, ativo: str | None):
-    if cliente and hasattr(Contrato, "nome_cli"):
-        q = q.filter(_ilike_ci(Contrato.nome_cli, cliente))
-    if contrato:
-        _, col = _pick_attr(Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato")
-        if col is None:
-            fallback = getattr(Contrato, "cabecalho_id", getattr(Contrato, "id"))
-            col = cast(fallback, String())
-        q = q.filter(_ilike_ci(col, contrato))
-    if ativo and hasattr(Contrato, "ativo"):
-        q = q.filter(_ilike_ci(Contrato.ativo, ativo))
-    return q
-
-def _tune_sqlite(db: Session):
-    try: db.execute(text("PRAGMA journal_mode=WAL"))
-    except Exception: pass
-    try: db.execute(text("PRAGMA busy_timeout=60000"))
-    except Exception: pass
-
 # --------- Fallback de template ---------
-def _template_response(ctx: dict):
+
+def _template_response(context: dict):
     for name in ["contratos_lista.html", "contratos.html", "contratos_list.html"]:
         try:
             templates.env.get_template(name)
-            return templates.TemplateResponse(name, ctx)
+            return templates.TemplateResponse(name, context)
         except TemplateNotFound:
             continue
     raise HTTPException(500, detail="Templates não encontrados: contratos_lista.html/contratos.html/contratos_list.html")
 
-# ------------------ LISTAGEM HTML ------------------
+# ------------------ LISTAGEM ------------------
 
 @router.get("")
 def contratos_view(
@@ -156,7 +160,16 @@ def contratos_view(
     order_dir: str = Query(default="desc"),
 ):
     q_base = db.query(Contrato)
-    q_base = _apply_filtros(q_base, cliente, contrato, ativo)
+    if cliente and hasattr(Contrato, "nome_cli"):
+        q_base = q_base.filter(_ilike_ci(Contrato.nome_cli, cliente))
+    if contrato:
+        _, col = _pick_attr(Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato")
+        if col is None:
+            col = cast(getattr(Contrato, "id"), String())
+        q_base = q_base.filter(_ilike_ci(col, contrato))
+    if ativo and hasattr(Contrato, "ativo"):
+        q_base = q_base.filter(_ilike_ci(Contrato.ativo, ativo))
+
     if not incluir_retornados:
         if hasattr(Contrato, "status"):
             q_base = q_base.filter(or_(Contrato.status.is_(None), func.upper(Contrato.status) != "RETORNADO"))
@@ -165,23 +178,17 @@ def contratos_view(
 
     total = q_base.count()
 
-    col = getattr(Contrato, order_by, None)
-    if col is None:
-        for name in ("data_envio", "id", "nome_cli", "ativo"):
-            col = getattr(Contrato, name, None)
-            if col is not None:
-                break
+    col = getattr(Contrato, order_by, None) or getattr(Contrato, "data_envio", None) or getattr(Contrato, "id")
     q_rows = q_base.order_by(desc(col) if str(order_dir).lower() == "desc" else asc(col))
     offset = (page - 1) * per_page
     rows = q_rows.offset(offset).limit(per_page).all()
 
-    # KPIs da lista
+    # KPIs
     mr_colname = _first_existing_name(Contrato, ["meses_restantes","meses_rest","meses_restante"]) or "meses_restantes"
     sq = q_base.with_entities(
         cast(Contrato.valor_mensal, Numeric).label("vm"),
         cast(getattr(Contrato, mr_colname), Numeric).label("mr"),
     ).subquery()
-
     valor_mensal_sum = float(db.query(func.coalesce(func.sum(sq.c.vm), 0)).scalar() or 0)
     backlog_sum = float(db.query(func.coalesce(func.sum(sq.c.vm * sq.c.mr), 0)).scalar() or 0)
 
@@ -270,9 +277,7 @@ def exportar_contratos(
     if fmt.lower() == "xlsx":
         try:
             from openpyxl import Workbook
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Contratos"
+            wb = Workbook(); ws = wb.active; ws.title = "Contratos"
             ws.append(headers)
             for r in rows: ws.append([r.get(h) for h in headers])
             bio = BytesIO(); wb.save(bio); bio.seek(0)
@@ -284,8 +289,7 @@ def exportar_contratos(
         except Exception:
             pass
 
-    sio = StringIO()
-    sio.write(";".join(headers) + "\n")
+    sio = StringIO(); sio.write(";".join(headers) + "\n")
     for r in rows:
         vals = [str(r.get(h, "")) for h in headers]
         sio.write(";".join(vals) + "\n")
@@ -345,14 +349,18 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
         if hasattr(it, "periodo_contratual") and prazo is not None:
             it.periodo_contratual = prazo
 
-        periodo = getattr(it, "periodo_contratual", None) or prazo or 0
+        periodo_raw = getattr(it, "periodo_contratual", None) or prazo
+        periodo = _to_int(periodo_raw, 0)
+        if periodo < 0:
+            periodo = 0
+
         data_inicio = _parse_date_any(
             getattr(it, "data_envio", None) or getattr(it, "data_inicio", None) or getattr(it, "data", None)
         )
         valor_mensal = _to_float(getattr(it, "valor_mensal", 0.0)) or 0.0
 
         try:
-            mr = calc_meses_restantes(data_inicio, int(periodo or 0)) if data_inicio else 0
+            mr = calc_meses_restantes(data_inicio, periodo) if data_inicio else 0
         except Exception:
             mr = 0
 
@@ -369,13 +377,13 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
                 changed = True
         if vg_name:
             prev = getattr(it, vg_name, None)
-            newv = calc_valor_global(valor_mensal, int(periodo or 0))
+            newv = calc_valor_global(valor_mensal, periodo)
             if force or prev != newv:
                 setattr(it, vg_name, newv)
                 changed = True
         if vp_name:
             prev = getattr(it, vp_name, None)
-            newv = _safe_valor_presente(valor_mensal, int(mr or 0), indice_anual)
+            newv = _safe_valor_presente(valor_mensal, mr, indice_anual)
             if force or prev != newv:
                 setattr(it, vp_name, newv)
                 changed = True
@@ -399,6 +407,7 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
 
     url = request.headers.get("referer") or f"/contratos/{contrato_num}"
     return RedirectResponse(url=f"{url}?ok=1&n={atualizados}&inalterados={inalterados}", status_code=303)
+
 
 @router.post("/sincronizar")
 def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
@@ -430,7 +439,8 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
             key = str(num).strip() if num is not None else None
             if not key:
                 continue
-            prazo = getattr(cab, prazo_name, None) if prazo_name else None
+            prazo_raw = getattr(cab, prazo_name, None) if prazo_name else None
+            prazo = _to_int(prazo_raw, 0) if prazo_raw is not None else None
             indice = getattr(cab, indice_name, None) if indice_name else None
             codcli = getattr(cab, "cod_cli", None) if codcli_header_exists else None
             header_map[key] = (prazo, indice, codcli)
@@ -459,7 +469,7 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
             nonlocal erros
             erros += 1
             err_types[kind] = err_types.get(kind, 0) + 1
-            if len(err_samples) < 50:
+            if len(err_samples) < 20:
                 err_samples.append({"id": item_id, "kind": kind, "msg": msg[:300]})
 
         def processar_lote(ids: list[int]):
@@ -489,6 +499,7 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                     prazo, indice_anual, cab_cod_cli = dados
 
                     try:
+                        # SAVEPOINT
                         with db_write.begin_nested():
                             if hasattr(it, "periodo_contratual") and prazo is not None:
                                 it.periodo_contratual = prazo
@@ -497,14 +508,18 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                                 it.cod_cli = cab_cod_cli
                                 copiados_cod_cli += 1
 
-                            periodo = getattr(it, "periodo_contratual", None) or prazo or 0
+                            periodo_raw = getattr(it, "periodo_contratual", None)
+                            periodo = _to_int(periodo_raw if periodo_raw is not None else prazo, 0)
+                            if periodo < 0:
+                                periodo = 0
+
                             data_inicio = _parse_date_any(
                                 getattr(it, "data_envio", None) or getattr(it, "data_inicio", None) or getattr(it, "data", None)
                             )
                             valor_mensal = _to_float(getattr(it, "valor_mensal", 0.0)) or 0.0
 
                             try:
-                                mr = calc_meses_restantes(data_inicio, int(periodo or 0)) if data_inicio else 0
+                                mr = calc_meses_restantes(data_inicio, periodo) if data_inicio else 0
                             except Exception:
                                 mr = 0
 
@@ -520,13 +535,13 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                                         changed = True
                                 if vg_name:
                                     prev = getattr(it, vg_name, None)
-                                    newv = calc_valor_global(valor_mensal, int(periodo or 0))
+                                    newv = calc_valor_global(valor_mensal, periodo)
                                     if force or prev != newv:
                                         setattr(it, vg_name, newv)
                                         changed = True
                                 if vp_name:
                                     prev = getattr(it, vp_name, None)
-                                    newv = _safe_valor_presente(valor_mensal, int(mr or 0), indice_anual)
+                                    newv = _safe_valor_presente(valor_mensal, mr, indice_anual)
                                     if force or prev != newv:
                                         setattr(it, vp_name, newv)
                                         changed = True
@@ -542,8 +557,10 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                 db_write.commit()
             except Exception as e:
                 log_error(e.__class__.__name__, str(e), None)
-                try: db_write.rollback()
-                except Exception: pass
+                try:
+                    db_write.rollback()
+                except Exception:
+                    pass
             finally:
                 db_write.close()
 
@@ -583,8 +600,11 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
         "copiados_cod_cli": copiados_cod_cli,
         "errors": erros,
     }
-    if debug and err_types:
-        payload["err_types"] = err_types
+    if debug:
+        if err_types:
+            payload["err_types"] = err_types
+        if err_samples:
+            payload["error_samples"] = err_samples
     if as_json:
         return JSONResponse(payload)
 
