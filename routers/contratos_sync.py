@@ -1,18 +1,14 @@
 # =============================================================================
 # routers/contratos_sync.py
-# Versão: v2.3.0 (2025-08-27)
+# Versão: v2.4.0 (2025-08-28)
 #
-# Novidades v2.3.0:
-#   • Batch sync robusto no Postgres:
-#       - Usa DUAS sessões: leitor (streaming c/ yield_per) e escritor (commits).
-#       - Evita fechar o cursor de streaming ao dar commit (antes acontecia no mesmo Session).
-#   • Mantém recursos das versões anteriores:
-#       - Filtros (cliente/contrato/ativo), paginação/ordenação
-#       - Agregações sem produto cartesiano
-#       - Export CSV/XLSX
-#       - Aliases de contexto e fallback de templates
-#       - Cálculo de meses_restantes / valor_global / valor_presente
-#       - Cópia de cod_cli do cabeçalho para itens
+# Mudanças v2.4.0 (foco Render/Postgres):
+#   • Removido streaming server-side (yield_per / stream_results) — agora paginação por PK (id > last_id LIMIT N).
+#   • Sessões separadas e curtas: leitura (para mapear cabeçalhos e buscar IDs) e escrita por lote (commits curtos).
+#   • Mantida querystring de retorno com métricas (ok, n, skips, err, codcli).
+#   • Código compatível com SQLite local (PRAGMAs opcionais).
+#
+# Baseado na v2.3.0 enviada pelo usuário (27/08/2025), com os mesmos endpoints e funcionalidades.
 # =============================================================================
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
@@ -22,7 +18,7 @@ from sqlalchemy import func, cast, Numeric, String, desc, asc, and_, or_, text, 
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateNotFound
 
-from database import get_db, SessionLocal  # <- usamos SessionLocal para sessões separadas (leitura/escrita)
+from database import get_db, SessionLocal  # Sessões separadas (leitura/escrita)
 from models import Contrato, ContratoCabecalho
 try:
     from models import ContratoLog  # opcional
@@ -184,9 +180,6 @@ def _tune_sqlite(db: Session):
         db.execute(text("PRAGMA busy_timeout=60000"))  # 60s
     except Exception:
         pass
-
-def _is_locked(exc: Exception) -> bool:
-    return "database is locked" in str(exc).lower()
 
 # ------------------ LISTAGEM HTML ------------------
 
@@ -405,10 +398,10 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
 @router.post("/sincronizar")
 def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
     """
-    Batch robusto: DUAS sessões (leitura/escrita) para evitar fechar o cursor
-    de streaming ao dar commit. Mantém retorno via redirect com querystring.
+    Batch robusto sem server-side cursor: paginação por PK (id > last_id LIMIT N)
+    com duas sessões (leitura → IDs/cabeçalhos; escrita → commits por lote).
     """
-    # --------- Sessão de LEITURA (streaming) ---------
+    # --------- Sessão de LEITURA ---------
     db_read = SessionLocal()
     try:
         # 1) Mapear cabeçalhos (número → (prazo, índice, cod_cli))
@@ -426,7 +419,8 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
         codcli_item_exists = hasattr(Contrato, "cod_cli")
 
         header_map: dict[str, tuple[int | None, float | None, str | None]] = {}
-        for cab in db_read.query(ContratoCabecalho).yield_per(500):
+        # Carrega tudo (tabela de cabeçalhos costuma ser pequena). Se crescer muito, migrar para paginação por PK.
+        for cab in db_read.query(ContratoCabecalho).all():
             num = getattr(cab, cab_num_name)
             key = str(num).strip() if num is not None else None
             if not key:
@@ -436,22 +430,15 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
             codcli = getattr(cab, "cod_cli", None) if codcli_header_exists else None
             header_map[key] = (prazo, indice, codcli)
 
-        # 2) Iterar IDs dos itens via streaming (NÃO dar commit nesta sessão)
+        # 2) Paginação por PK (id > last_id)
         batch_size = 500
-        id_stream = (
-            db_read.execute(
-                select(Contrato.id).execution_options(stream_results=True)
-            ).scalars().yield_per(batch_size)
-        )
-
-        # --------- Sessão de ESCRITA (commits por lote) ---------
         atualizados = 0
         pulados_sem_cab = 0
         pulados_retornado = 0
         copiados_cod_cli = 0
         erros = 0
 
-        buffer_ids = []
+        last_id = 0
 
         def processar_lote(ids: list[int]):
             nonlocal atualizados, pulados_sem_cab, pulados_retornado, copiados_cod_cli, erros
@@ -459,9 +446,7 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                 return
             db_write = SessionLocal()
             try:
-                # Ajuste SQLite local (inofensivo no Postgres)
-                _tune_sqlite(db_write)
-
+                _tune_sqlite(db_write)  # inofensivo no Postgres
                 itens = db_write.query(Contrato).filter(Contrato.id.in_(ids)).all()
                 for it in itens:
                     try:
@@ -469,8 +454,10 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                             pulados_retornado += 1
                             continue
 
-                        # número do item
                         item_num_name, _ = _pick_attr(Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato")
+                        if not item_num_name:
+                            pulados_sem_cab += 1
+                            continue
                         num_val = getattr(it, item_num_name)
                         dados = header_map.get(str(num_val).strip() if num_val is not None else "")
                         if not dados:
@@ -498,9 +485,12 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
 
                         atualizados += 1
                     except Exception:
+                        # Se ocorrer erro de validação/atribuição no item, tentamos seguir adiante.
+                        try:
+                            db_write.rollback()
+                        except Exception:
+                            pass
                         erros += 1
-                        db_write.rollback()
-                # commit do lote
                 db_write.flush()
                 db_write.commit()
             except Exception:
@@ -512,14 +502,19 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
             finally:
                 db_write.close()
 
-        for _id in id_stream:
-            buffer_ids.append(int(_id))
-            if len(buffer_ids) >= batch_size:
-                processar_lote(buffer_ids)
-                buffer_ids = []
-
-        # resto
-        processar_lote(buffer_ids)
+        while True:
+            id_rows = (
+                db_read.query(Contrato.id)
+                .filter(Contrato.id > last_id)
+                .order_by(Contrato.id)
+                .limit(batch_size)
+                .all()
+            )
+            ids = [int(r[0] if isinstance(r, (list, tuple)) else getattr(r, "id", r)) for r in id_rows]
+            if not ids:
+                break
+            processar_lote(ids)
+            last_id = ids[-1]
 
     finally:
         db_read.close()
