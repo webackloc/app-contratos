@@ -340,11 +340,11 @@ def exportar_contratos(
             pass
 
     sio = StringIO()
-    sio.write(";".join(headers) + "
+    sio.write(";".join(headers) + "\n")
 ")
     for r in rows:
         vals = [str(r.get(h, "")) for h in headers]
-        sio.write(";".join(vals) + "
+        sio.write(";".join(vals) + "\n")
 ")
     sio.seek(0)
     return StreamingResponse(
