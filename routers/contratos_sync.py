@@ -1,18 +1,13 @@
 # =============================================================================
 # routers/contratos_sync.py
-# Versão: v2.4.6 (2025-08-28)
+# Versão: v2.4.7 (2025-08-28)
 #
 # Objetivo desta versão
-# - Garantir que o código certo está carregando (log de versão na inicialização).
-# - Atualizar campos mesmo com nomes diferentes (aliases) e reportar no redirect:
-#     • meses_restantes | meses_rest
-#     • valor_global_contrato | valor_global | valor_global_total | valor_total
-#     • valor_presente_contrato | valor_presente | valor_presente_total
-#       | valor_presente_backlog | backlog | backlog_total
+# - Diagnóstico claro: endpoint /contratos/_diag e opção JSON em /sincronizar.
+# - Log de versão ao carregar para confirmar que este arquivo está ativo.
+# - Aliases de campos ampliados (inclui 'meses_restante').
 # - SAVEPOINT por item, paginação por PK, logs de erros em runtime/sync_errors.jsonl.
-# - Contadores detalhados: atualizados, inalterados, skip_sem_cab, skip_ret,
-#   skip_campos, codcli copiados, erros e err_types (se debug=1).
-# - Endpoint de diagnóstico GET /contratos/_diag para ver campos detectados.
+# - Params úteis: debug=1 (adiciona err_types), json=1 (retorna JSON), force=1 (marca changed=True para todos os itens válidos).
 # =============================================================================
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
@@ -38,7 +33,7 @@ from datetime import datetime, date
 import json, os, logging
 
 # --------- versão/log ---------
-VERSION = "v2.4.6"
+VERSION = "v2.4.7"
 log = logging.getLogger("uvicorn.error")
 log.info("[contratos_sync] carregado %s", VERSION)
 
@@ -136,78 +131,6 @@ def _apply_filtros(q, cliente: str | None, contrato: str | None, ativo: str | No
     return q
 
 
-def _filtrar_apenas_em_carteira(q, db: Session):
-    if hasattr(Contrato, "status") or hasattr(Contrato, "data_retorno"):
-        conds = []
-        if hasattr(Contrato, "status"):
-            conds.append(or_(Contrato.status.is_(None), func.upper(Contrato.status) != "RETORNADO"))
-        if hasattr(Contrato, "data_retorno"):
-            conds.append(or_(Contrato.data_retorno.is_(None), cast(Contrato.data_retorno, String) == ""))
-        if conds:
-            from sqlalchemy import and_ as _and
-            return q.filter(_and(*conds))
-
-    if not ContratoLog:
-        return q
-
-    date_col = None
-    for c in ("data_mov", "data", "created_at", "timestamp"):
-        if hasattr(ContratoLog, c):
-            date_col = getattr(ContratoLog, c)
-            break
-    if date_col is None:
-        return q
-
-    keys = []
-    if hasattr(ContratoLog, "contrato_num"): keys.append(ContratoLog.contrato_num)
-    if hasattr(ContratoLog, "ativo"):        keys.append(ContratoLog.ativo)
-    if hasattr(ContratoLog, "cod_cli"):      keys.append(ContratoLog.cod_cli)
-
-    sub = (
-        db.query(*(k.label(f"k{i}") for i, k in enumerate(keys)), func.max(date_col).label("last_dt"))
-        .group_by(*keys)
-    ).subquery("lasts")
-
-    from sqlalchemy.orm import aliased
-    L = aliased(ContratoLog)
-    join_conds = []
-    if hasattr(ContratoLog, "contrato_num"):
-        join_conds.append(L.contrato_num == (sub.c.k0 if "k0" in sub.c else L.contrato_num))
-    if hasattr(ContratoLog, "ativo"):
-        if "k1" in sub.c: join_conds.append(L.ativo == sub.c.k1)
-        elif "k0" in sub.c: join_conds.append(L.ativo == sub.c.k0)
-    if hasattr(ContratoLog, "cod_cli"):
-        for k in ("k2", "k1", "k0"):
-            if k in sub.c:
-                join_conds.append(L.cod_cli == sub.c[k])
-                break
-    join_conds.append(L.__table__.c[date_col.key] == sub.c.last_dt)
-
-    q = (
-        q.join(
-            sub,
-            and_(
-                (Contrato.contrato_num == sub.c.k0) if "k0" in sub.c and hasattr(Contrato, "contrato_num") else True,
-                (Contrato.ativo == sub.c.k1) if "k1" in sub.c and hasattr(Contrato, "ativo") else True,
-                (Contrato.cod_cli == sub.c.k2) if "k2" in sub.c and hasattr(Contrato, "cod_cli") else True,
-            )
-        )
-        .join(L, and_(*join_conds))
-        .filter(L.tp_transacao != "RETORNO")
-    )
-    return q
-
-
-def _template_response(context: dict):
-    for name in ["contratos_lista.html", "contratos.html", "contratos_list.html"]:
-        try:
-            templates.env.get_template(name)
-            return templates.TemplateResponse(name, context)
-        except TemplateNotFound:
-            continue
-    raise HTTPException(500, detail="Templates não encontrados: contratos_lista.html, contratos.html ou contratos_list.html")
-
-
 def _tune_sqlite(db: Session):
     try:
         db.execute(text("PRAGMA journal_mode=WAL"))
@@ -235,9 +158,12 @@ def contratos_view(
 ):
     q_base = db.query(Contrato)
     q_base = _apply_filtros(q_base, cliente, contrato, ativo)
-    usar_carteira = not incluir_retornados
-    if usar_carteira:
-        q_base = _filtrar_apenas_em_carteira(q_base, db)
+    if not incluir_retornados:
+        # Usando somente itens em carteira quando possível
+        if hasattr(Contrato, "status"):
+            q_base = q_base.filter(or_(Contrato.status.is_(None), func.upper(Contrato.status) != "RETORNADO"))
+        if hasattr(Contrato, "data_retorno"):
+            q_base = q_base.filter(or_(Contrato.data_retorno.is_(None), cast(Contrato.data_retorno, String) == ""))
 
     total = q_base.count()
 
@@ -251,19 +177,10 @@ def contratos_view(
     offset = (page - 1) * per_page
     rows = q_rows.offset(offset).limit(per_page).all()
 
-    usando_retornados = False
-    if total == 0 and usar_carteira:
-        q_base = db.query(Contrato)
-        q_base = _apply_filtros(q_base, cliente, contrato, ativo)
-        total = q_base.count()
-        q_rows = q_base.order_by(desc(col) if str(order_dir).lower() == "desc" else asc(col))
-        rows = q_rows.offset(offset).limit(per_page).all()
-        usando_retornados = True
-        incluir_retornados = True
-
+    # KPIs da lista
     sq = q_base.with_entities(
         cast(Contrato.valor_mensal, Numeric).label("vm"),
-        cast(Contrato.meses_restantes, Numeric).label("mr"),
+        cast(getattr(Contrato, _first_existing_name(Contrato, ["meses_restantes","meses_rest"]) or "meses_restantes"), Numeric).label("mr"),
     ).subquery()
 
     valor_mensal_sum = db.query(func.coalesce(func.sum(sq.c.vm), 0)).scalar() or 0
@@ -283,14 +200,26 @@ def contratos_view(
         "contrato": contrato or "",
         "ativo": ativo or "",
         "incluir_retornados": incluir_retornados,
-        "incluirRetornados": incluir_retornados,
-        "usando_retornados": usando_retornados,
         "valor_mensal_sum": float(valor_mensal_sum),
         "backlog_sum": float(backlog_sum),
         "valor_mensal_total": float(valor_mensal_sum),
         "backlog_total": float(backlog_sum),
     }
-    return _template_response(ctx)
+    return templates.TemplateResponse("contratos_lista.html", ctx)
+
+# ------------------ DIAGNÓSTICO ------------------
+
+@router.get("/_diag")
+def diagnostico(db: Session = Depends(get_db)):
+    mr_name = _first_existing_name(Contrato, ["meses_restantes", "meses_rest", "meses_restante"]) or None
+    vg_name = _first_existing_name(Contrato, ["valor_global_contrato", "valor_global", "valor_global_total", "valor_total"]) or None
+    vp_name = _first_existing_name(Contrato, ["valor_presente_contrato", "valor_presente", "valor_presente_total", "valor_presente_backlog", "backlog", "backlog_total"]) or None
+    total = db.query(func.count(getattr(Contrato, 'id'))).scalar() if hasattr(Contrato, 'id') else None
+    return JSONResponse({
+        "version": VERSION,
+        "dest": {"mr": mr_name, "vg": vg_name, "vp": vp_name},
+        "total_contratos": int(total or 0),
+    })
 
 # ------------------ EXPORTAÇÃO ------------------
 
@@ -309,7 +238,10 @@ def exportar_contratos(
     q = db.query(Contrato)
     q = _apply_filtros(q, cliente, contrato, ativo)
     if not incluir_retornados:
-        q = _filtrar_apenas_em_carteira(q, db)
+        if hasattr(Contrato, "status"):
+            q = q.filter(or_(Contrato.status.is_(None), func.upper(Contrato.status) != "RETORNADO"))
+        if hasattr(Contrato, "data_retorno"):
+            q = q.filter(or_(Contrato.data_retorno.is_(None), cast(Contrato.data_retorno, String) == ""))
 
     col = getattr(Contrato, order_by, None)
     if col is None:
@@ -320,7 +252,7 @@ def exportar_contratos(
         contrato_num = getattr(c, "contrato_num", getattr(c, "contrato_n", None))
         data_envio = getattr(c, "data_envio", None)
         vm = float(getattr(c, "valor_mensal", 0) or 0)
-        mr_name = _first_existing_name(Contrato, ["meses_restantes", "meses_rest"]) or "meses_restantes"
+        mr_name = _first_existing_name(Contrato, ["meses_restantes", "meses_rest", "meses_restante"]) or "meses_restantes"
         mr = int(getattr(c, mr_name, 0) or 0)
         return {
             "Ativo": getattr(c, "ativo", None),
@@ -394,7 +326,7 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
     if item_num_col is None:
         raise HTTPException(500, detail="Contrato (itens) sem coluna de número.")
 
-    mr_aliases = ["meses_restantes", "meses_rest"]
+    mr_aliases = ["meses_restantes", "meses_rest", "meses_restante"]
     vg_aliases = ["valor_global_contrato", "valor_global", "valor_global_total", "valor_total"]
     vp_aliases = ["valor_presente_contrato", "valor_presente", "valor_presente_total", "valor_presente_backlog", "backlog", "backlog_total"]
 
@@ -407,6 +339,8 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
 
     atualizados = 0
     inalterados = 0
+
+    force = request.query_params.get("force") in {"1","true","True"}
 
     for it in itens:
         if hasattr(it, "cod_cli") and cab_cod_cli and getattr(it, "cod_cli", None) != cab_cod_cli:
@@ -426,27 +360,28 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
         except Exception:
             mr = 0
 
-        changed = False
+        # definir nos primeiros nomes existentes
         mr_name = _first_existing_name(Contrato, mr_aliases)
         vg_name = _first_existing_name(Contrato, vg_aliases)
         vp_name = _first_existing_name(Contrato, vp_aliases)
 
+        changed = False
         if mr_name:
             prev = getattr(it, mr_name, None)
             newv = int(mr or 0)
-            if prev != newv:
+            if force or prev != newv:
                 setattr(it, mr_name, newv)
                 changed = True
         if vg_name:
             prev = getattr(it, vg_name, None)
             newv = calc_valor_global(valor_mensal, int(periodo or 0))
-            if prev != newv:
+            if force or prev != newv:
                 setattr(it, vg_name, newv)
                 changed = True
         if vp_name:
             prev = getattr(it, vp_name, None)
             newv = _safe_valor_presente(valor_mensal, int(mr or 0), indice_anual)
-            if prev != newv:
+            if force or prev != newv:
                 setattr(it, vp_name, newv)
                 changed = True
 
@@ -456,28 +391,30 @@ def sincronizar_contrato(contrato_num: str, request: Request, db: Session = Depe
             inalterados += 1
 
     db.commit()
+
+    # resposta
+    if request.query_params.get("json") in {"1","true","True"} or request.query_params.get("format") == "json":
+        return JSONResponse({
+            "version": VERSION,
+            "dest": {"mr": mr_name, "vg": vg_name, "vp": vp_name},
+            "ok": 1,
+            "updated": atualizados,
+            "unchanged": inalterados,
+            "scope": "single",
+        })
+
     url = request.headers.get("referer") or f"/contratos/{contrato_num}"
-    dest = {"mr": mr_name, "vg": vg_name, "vp": vp_name}
-    return RedirectResponse(url=f"{url}?ok=1&n={atualizados}&inalterados={inalterados}&dest={dest}", status_code=303)
-
-
-@router.get("/_diag")
-def diagnostico(db: Session = Depends(get_db)):
-    mr_name = _first_existing_name(Contrato, ["meses_restantes", "meses_rest"]) or None
-    vg_name = _first_existing_name(Contrato, ["valor_global_contrato", "valor_global", "valor_global_total", "valor_total"]) or None
-    vp_name = _first_existing_name(Contrato, ["valor_presente_contrato", "valor_presente", "valor_presente_total", "valor_presente_backlog", "backlog", "backlog_total"]) or None
-    total = db.query(func.count(Contrato.id)).scalar() if hasattr(Contrato, 'id') else None
-    return JSONResponse({
-        "version": VERSION,
-        "dest": {"mr": mr_name, "vg": vg_name, "vp": vp_name},
-        "total_contratos": int(total or 0),
-    })
+    return RedirectResponse(url=f"{url}?ok=1&n={atualizados}&inalterados={inalterados}", status_code=303)
 
 
 @router.post("/sincronizar")
 def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
-    """Batch robusto (sem server-side cursor) e compatível com variações de esquema."""
+    """Batch robusto compatível com variações de esquema.
+    Params: debug=1 | json=1 | force=1
+    """
     debug = request.query_params.get("debug") in {"1", "true", "True"}
+    as_json = request.query_params.get("json") in {"1", "true", "True"} or request.query_params.get("format") == "json"
+    force = request.query_params.get("force") in {"1","true","True"}
 
     # --------- Sessão de LEITURA ---------
     db_read = SessionLocal()
@@ -506,7 +443,7 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
             codcli = getattr(cab, "cod_cli", None) if codcli_header_exists else None
             header_map[key] = (prazo, indice, codcli)
 
-        mr_aliases = ["meses_restantes", "meses_rest"]
+        mr_aliases = ["meses_restantes", "meses_rest", "meses_restante"]
         vg_aliases = ["valor_global_contrato", "valor_global", "valor_global_total", "valor_total"]
         vp_aliases = ["valor_presente_contrato", "valor_presente", "valor_presente_total", "valor_presente_backlog", "backlog", "backlog_total"]
         mr_name = _first_existing_name(Contrato, mr_aliases)
@@ -586,19 +523,19 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                                 if mr_name:
                                     prev = getattr(it, mr_name, None)
                                     newv = int(mr or 0)
-                                    if prev != newv:
+                                    if force or prev != newv:
                                         setattr(it, mr_name, newv)
                                         changed = True
                                 if vg_name:
                                     prev = getattr(it, vg_name, None)
                                     newv = calc_valor_global(valor_mensal, int(periodo or 0))
-                                    if prev != newv:
+                                    if force or prev != newv:
                                         setattr(it, vg_name, newv)
                                         changed = True
                                 if vp_name:
                                     prev = getattr(it, vp_name, None)
                                     newv = _safe_valor_presente(valor_mensal, int(mr or 0), indice_anual)
-                                    if prev != newv:
+                                    if force or prev != newv:
                                         setattr(it, vp_name, newv)
                                         changed = True
 
@@ -644,13 +581,27 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
     finally:
         db_read.close()
 
+    # Saída
+    payload = {
+        "version": VERSION,
+        "dest": {"mr": mr_name, "vg": vg_name, "vp": vp_name},
+        "ok": 1,
+        "updated": atualizados,
+        "unchanged": inalterados,
+        "skip_sem_cab": pulados_sem_cab,
+        "skip_ret": pulados_retornado,
+        "skip_campos": skip_campos,
+        "copiados_cod_cli": copiados_cod_cli,
+        "errors": erros,
+    }
+    if debug and err_types:
+        payload["err_types"] = err_types
+    if as_json:
+        return JSONResponse(payload)
+
     url = request.headers.get("referer") or "/contratos"
     qp = (
         f"?ok=1&n={atualizados}&inalterados={inalterados}&skip_sem_cab={pulados_sem_cab}"
         f"&skip_ret={pulados_retornado}&codcli={copiados_cod_cli}&skip_campos={skip_campos}&err={erros}"
-        f"&dest={{'mr':{mr_name!s},'vg':{vg_name!s},'vp':{vp_name!s}}}"
     )
-    if debug and err_types:
-        err_types_str = ",".join(f"{k}:{v}" for k, v in sorted(err_types.items()))
-        qp += f"&err_types={err_types_str}"
     return RedirectResponse(url + qp, status_code=303)
