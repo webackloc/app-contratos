@@ -1,13 +1,16 @@
 # =============================================================================
 # routers/contratos_sync.py
-# Versão: v2.4.1 (2025-08-28)
+# Versão: v2.4.2 (2025-08-28)
+#
+# Mudanças v2.4.2:
+#   • Corrige strings quebradas no bloco de exportação CSV e no log JSONL.
+#   • Pequena robustez em _apply_filtros (fallback para cabecalho_id/id).
+#   • Mantém todas as melhorias da v2.4.1 (SAVEPOINT por item, debug=1, etc.).
 #
 # Mudanças v2.4.1:
-#   • Corrige caso "atualizados=0" quando existem erros no lote: usa SAVEPOINT
-#     (begin_nested) por item, evitando que um erro cause rollback do lote todo.
-#   • Coleta amostras de erros em runtime/sync_errors.jsonl (até 50 por execução).
-#   • Cálculos mais tolerantes: datas e valores com fallback seguro.
-#   • Parâmetro opcional debug=1 para intensificar logs e retornar err_types.
+#   • SAVEPOINT por item (begin_nested) para não derrubar o lote inteiro.
+#   • Loga amostras de erro em runtime/sync_errors.jsonl.
+#   • Cálculos tolerantes para datas e valores.
 #
 # Mudanças v2.4.0 (base):
 #   • Removido streaming server-side; paginação por PK (id > last_id LIMIT N).
@@ -17,7 +20,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from starlette.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func, cast, Numeric, String, desc, asc, and_, or_, text, select
+from sqlalchemy import func, cast, Numeric, String, desc, asc, and_, or_, text
 from fastapi.templating import Jinja2Templates
 from jinja2 import TemplateNotFound
 
@@ -60,7 +63,9 @@ def _to_float(val):
             return None
         if isinstance(val, (int, float)):
             return float(val)
-        s = str(val).strip().replace(" ", "").replace(".", "").replace(",", ".") if isinstance(val, str) else str(val)
+        s = str(val).strip()
+        if isinstance(val, str):
+            s = s.replace(" ", "").replace(".", "").replace(",", ".")
         return float(s) if s != "" else None
     except Exception:
         return None
@@ -113,7 +118,9 @@ def _apply_filtros(q, cliente: str | None, contrato: str | None, ativo: str | No
     if contrato:
         _, col = _pick_attr(Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato")
         if col is None:
-            col = cast(getattr(Contrato, "cabecalho_id"), String())
+            # fallback seguro: tenta cabecalho_id, senão id
+            fallback = getattr(Contrato, "cabecalho_id", getattr(Contrato, "id"))
+            col = cast(fallback, String())
         q = q.filter(_ilike_ci(col, contrato))
     if ativo and hasattr(Contrato, "ativo"):
         q = q.filter(_ilike_ci(Contrato.ativo, ativo))
@@ -341,11 +348,9 @@ def exportar_contratos(
 
     sio = StringIO()
     sio.write(";".join(headers) + "\n")
-")
     for r in rows:
         vals = [str(r.get(h, "")) for h in headers]
         sio.write(";".join(vals) + "\n")
-")
     sio.seek(0)
     return StreamingResponse(
         sio,
@@ -524,13 +529,11 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
                             it.valor_global_contrato = calc_valor_global(valor_mensal, int(periodo or 0))
                             it.valor_presente_contrato = _safe_valor_presente(valor_mensal, it.meses_restantes, indice_anual)
 
-                            # flush dentro do savepoint (se quebrar, só esse item volta)
-                            db_write.flush()
+                            db_write.flush()  # dentro do savepoint
                             atualizados += 1
                     except Exception as e:
                         kind = e.__class__.__name__
                         log_error(kind, str(e), getattr(it, "id", None))
-                        # após rollback do savepoint, seguimos p/ próximo item
                 db_write.commit()
             except Exception as e:
                 log_error(e.__class__.__name__, str(e), None)
@@ -555,14 +558,12 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
             processar_lote(ids)
             last_id = ids[-1]
 
-        # Grava amostras de erros
         if err_samples:
             os.makedirs("runtime", exist_ok=True)
             with open("runtime/sync_errors.jsonl", "a", encoding="utf-8") as f:
                 for s in err_samples:
                     s["ts"] = datetime.utcnow().isoformat()
-                    f.write(json.dumps(s, ensure_ascii=False) + "
-")
+                    f.write(json.dumps(s, ensure_ascii=False) + "\n")
 
     finally:
         db_read.close()
@@ -573,7 +574,6 @@ def sincronizar_todos(request: Request, db: Session = Depends(get_db)):
         f"&codcli={copiados_cod_cli}&err={erros}"
     )
     if debug and erros:
-        # inclui classes de erro para inspeção rápida
-        err_types_str = ",".join(f"{k}:{v}" for k,v in sorted(err_types.items()))
+        err_types_str = ",".join(f"{k}:{v}" for k, v in sorted(err_types.items()))
         qp += f"&err_types={err_types_str}"
     return RedirectResponse(url + qp, status_code=303)
