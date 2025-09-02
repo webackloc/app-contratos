@@ -1,21 +1,27 @@
 # database.py
 # -----------------------------------------------------------------------------
-# Versão: 2.2.1 (2025-08-28)
-# Mudanças vs 2.2.0:
-# - Autodetecção de driver: se APP_DB_DRIVER não estiver definido, tenta usar
-#   psycopg (v3) se instalado; caso contrário, cai para psycopg2. Evita
-#   ModuleNotFoundError quando requirements só tem psycopg.
-# - Mantém NullPool por padrão (bom para Render) e todas as opções anteriores.
+# Versão: 2.3.0 (2025-09-02)
+# Mudanças vs 2.2.1:
+# - [FIX] SessionLocal agora usa expire_on_commit=False por padrão para evitar
+#   DetachedInstanceError ao acessar atributos após commit.
+# - [NEW] db_session(): context manager para abrir/fechar sessão c/ commit/rollback.
+# - [NEW] db_transaction(db): context manager para bloco transacional coeso.
+# - [NEW] ensure_attached(db, obj): garante que um ORM possivelmente detached
+#   seja "re-anexado" à sessão via merge(load=False).
+# - [IMP] engine_info() inclui expire_on_commit.
+# - Mantém autodetecção de driver, NullPool/QueuePool, SSL e demais configs.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from typing import Generator, Optional
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import create_engine, inspect as sa_inspect
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from sqlalchemy.pool import NullPool, QueuePool
 
 Base = declarative_base()
@@ -62,7 +68,7 @@ def _apply_driver_and_ssl(url: str, prefer_driver: str | None = None) -> str:
     q = dict(parse_qsl(parsed.query, keep_blank_values=True))
 
     host_is_render = isinstance(parsed.hostname, str) and "render.com" in parsed.hostname
-    force_ssl = os.getenv("FORCE_DB_SSL", "0").strip() in {"1", "true", "True"}
+    force_ssl = os.getenv("FORCE_DB_SSL", "0").strip().lower() in {"1", "true"}
     if (host_is_render or force_ssl) and "sslmode" not in {k.lower(): v for k, v in q.items()}:
         q["sslmode"] = "require"
 
@@ -109,6 +115,7 @@ else:
     else:
         engine_kwargs.update({"poolclass": NullPool})
 
+    # Parâmetros de keepalive (libpq) funcionam para psycopg/psycopg2
     connect_args.update({
         "keepalives": 1,
         "keepalives_idle": 30,
@@ -126,15 +133,78 @@ engine = create_engine(
     **engine_kwargs,
 )
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Permite override por env, mas por padrão DESATIVA expiração pós-commit
+_expire_default = os.getenv("APP_DB_EXPIRE_ON_COMMIT", "false").strip().lower() in {"1", "true", "yes"}
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine,
+    expire_on_commit=_expire_default,  # <- chave para evitar DetachedInstanceError
+)
 
 
-def get_db():
+def get_db() -> Generator[Session, None, None]:
+    """Dependência FastAPI padrão: abre sessão por request."""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+
+# ------------------------- context helpers (recomendado p/ importação) -------------------------
+
+@contextmanager
+def db_session(commit: bool = True) -> Generator[Session, None, None]:
+    """
+    Abre uma sessão, faz commit (ou rollback se der erro) e fecha.
+    Uso típico em jobs/lotes (ex.: importação):
+        with db_session() as db:
+            ... (operações) ...
+    """
+    db = SessionLocal()
+    try:
+        yield db
+        if commit:
+            db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@contextmanager
+def db_transaction(db: Session) -> Generator[Session, None, None]:
+    """
+    Inicia um bloco transacional dentro de uma sessão existente.
+    Útil para garantir que um conjunto de operações seja aplicado atômicamente:
+        with db_session() as db:
+            with db_transaction(db):
+                ... (ENVIO/TROCA/RETORNO em sequência) ...
+    """
+    # O context manager do SQLAlchemy já cuida de commit/rollback
+    with db.begin():
+        yield db
+
+
+def ensure_attached(db: Session, obj):
+    """
+    Garante que 'obj' (um ORM) esteja ligado à sessão 'db'.
+    Se estiver 'detached', faz merge(load=False) para re-anexar sem recarregar do banco.
+    Retorna o objeto anexado.
+    """
+    if obj is None:
+        return None
+    try:
+        state = sa_inspect(obj)
+    except Exception:
+        # Se não for um objeto ORM, retorna como está
+        return obj
+    if state.detached:
+        # evita refresh automático; perfeito para casos onde só precisamos do id/relacionamentos já carregados
+        return db.merge(obj, load=False)
+    return obj
 
 
 # ------------------------- util opcional (debug) -------------------------
@@ -158,4 +228,5 @@ def engine_info() -> dict:
         "pool": engine.pool.__class__.__name__,
         "driver": urlparse(DATABASE_URL).scheme,
         "pre_ping": engine_kwargs.get("pool_pre_ping", False),
+        "expire_on_commit": _expire_default,
     }
