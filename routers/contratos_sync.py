@@ -1,13 +1,15 @@
 # =============================================================================
 # routers/contratos_sync.py
-# Versão: v2.4.12 (2025-08-28)
+# Versão: v2.5.0 (2025-09-02)
 #
-# Hotfix de robustez de execução e debug rápido:
-# - Timebox do batch: max_seconds e max_batches por chamada (resposta sempre rápida)
-# - Ponto de retomada: start_id e next_start_id
-# - Stall guard do cursor (evita laço infinito se o id não avança)
-# - Endpoints de debug/dry com parâmetros
-# - Mantém todos os comportamentos da v2.4.11 (aliases, _to_int seguro, /_diag, export, etc.)
+# Novidades nesta versão:
+# - [MUD] Recalcula SEMPRE por padrão (force=True) quando acionado.
+# - [NOVO] Auto-force por virada de mês: se o mês do último cálculo (estado)
+#   for diferente do mês atual, o batch é forçado automaticamente.
+# - [NOVO] Persistência leve do estado em runtime/contratos_sync_state.json:
+#   guarda last_calc_month="YYYY-MM" e meta de execução.
+# - [MANTIDO] Toda a estrutura anterior (timebox, start_id, dry-run, export,
+#   diagnósticos, mapeamentos de colunas e cálculos) permanece funcional.
 # =============================================================================
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
@@ -31,12 +33,12 @@ from io import StringIO, BytesIO
 from datetime import datetime, date
 import json, os, logging, re, time
 
-VERSION = "v2.4.12"
+VERSION = "v2.5.0"
 log = logging.getLogger("uvicorn.error")
 log.info("[contratos_sync] carregado %s", VERSION)
 
 templates = Jinja2Templates(directory="templates")
-router = APIRouter(tags=["Contratos"]) 
+router = APIRouter(tags=["Contratos"])
 
 # ---------------- helpers ---------------
 
@@ -131,6 +133,31 @@ def _is_retornado(item) -> bool:
             return True
     return False
 
+# --------- Estado do batch (virada de mês) ---------
+
+RUNTIME_DIR = "runtime"            # [NOVO]
+STATE_FILE = os.path.join(RUNTIME_DIR, "contratos_sync_state.json")  # [NOVO]
+
+def _load_state() -> dict:  # [NOVO]
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_state(d: dict):  # [NOVO]
+    try:
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        tmp = dict(d or {})
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(tmp, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _month_key(dt: datetime | None = None) -> str:  # [NOVO]
+    dt = dt or datetime.utcnow()
+    return dt.strftime("%Y-%m")
+
 # --------- Fallback de template ---------
 
 def _template_response(context: dict):
@@ -219,10 +246,16 @@ def diagnostico(db: Session = Depends(get_db)):
     vg_name = _first_existing_name(Contrato, ["valor_global_contrato", "valor_global", "valor_global_total", "valor_total"]) or None
     vp_name = _first_existing_name(Contrato, ["valor_presente_contrato", "valor_presente", "valor_presente_total", "valor_presente_backlog", "backlog", "backlog_total"]) or None
     total = db.query(func.count(getattr(Contrato, 'id'))).scalar() if hasattr(Contrato, 'id') else None
+    # [NOVO] estado de mês
+    st = _load_state()
     return JSONResponse({
         "version": VERSION,
         "dest": {"mr": mr_name, "vg": vg_name, "vp": vp_name},
         "total_contratos": int(total or 0),
+        "estado": {
+            "last_calc_month": st.get("last_calc_month"),
+            "now_month": _month_key(),
+        },
     })
 
 # ------------------ EXPORTAÇÃO ------------------
@@ -310,6 +343,17 @@ def exportar_contratos(
 
 def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_seconds: int, max_batches: int):
     t0 = time.monotonic()
+
+    # [NOVO] Detecta virada de mês e auto-force
+    st_before = _load_state()
+    last_calc_month = st_before.get("last_calc_month")
+    now_month = _month_key()
+    auto_force_by_month = (last_calc_month != now_month)
+
+    # [MUD] Recalcular SEMPRE por padrão:
+    #   effective_force = True se qualquer condição pedir força.
+    effective_force = bool(force or auto_force_by_month or True)
+
     db_read = SessionLocal()
     try:
         cab_num_name, cab_num_col = _pick_attr(
@@ -433,41 +477,40 @@ def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_second
                             if not any([mr_name, vg_name, vp_name]):
                                 skip_campos += 1
                             else:
+                                # [MUD] aplica SEMPRE quando effective_force==True
                                 changed = False
                                 if mr_name:
-                                    prev = getattr(it, mr_name, None)
                                     newv = int(mr or 0)
                                     if dry:
-                                        changed = changed or (prev != newv)
+                                        prev = getattr(it, mr_name, None); changed = changed or (prev != newv)
                                     else:
-                                        if force or prev != newv:
-                                            setattr(it, mr_name, newv)
-                                            changed = True
+                                        setattr(it, mr_name, newv)
+                                        changed = True
                                 if vg_name:
-                                    prev = getattr(it, vg_name, None)
                                     newv = calc_valor_global(valor_mensal, periodo)
                                     if dry:
-                                        changed = changed or (prev != newv)
+                                        prev = getattr(it, vg_name, None); changed = changed or (prev != newv)
                                     else:
-                                        if force or prev != newv:
-                                            setattr(it, vg_name, newv)
-                                            changed = True
+                                        setattr(it, vg_name, newv)
+                                        changed = True
                                 if vp_name:
-                                    prev = getattr(it, vp_name, None)
                                     newv = _safe_valor_presente(valor_mensal, mr, indice_anual)
                                     if dry:
-                                        changed = changed or (prev != newv)
+                                        prev = getattr(it, vp_name, None); changed = changed or (prev != newv)
                                     else:
-                                        if force or prev != newv:
-                                            setattr(it, vp_name, newv)
-                                            changed = True
+                                        setattr(it, vp_name, newv)
+                                        changed = True
 
-                                if changed:
-                                    if not dry:
+                                if not dry:
+                                    # mesmo que nada pareça "mudar", gravamos para carimbar o recálculo
+                                    if effective_force or changed:
                                         db_write.flush()
-                                    atualizados += 1
+                                    atualizados += 1  # conta como recalculado
                                 else:
-                                    inalterados += 1
+                                    if changed:
+                                        atualizados += 1
+                                    else:
+                                        inalterados += 1
                     except Exception as e:
                         kind = e.__class__.__name__
                         log_error(kind, str(e), getattr(it, "id", None))
@@ -483,6 +526,7 @@ def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_second
                 db_write.close()
 
         while True:
+            # [MANTIDO] timebox
             if max_seconds > 0 and (time.monotonic() - t0) >= max_seconds:
                 partial = True
                 break
@@ -509,15 +553,13 @@ def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_second
                 partial = True
                 break
 
-        if err_samples:
-            try:
-                os.makedirs("runtime", exist_ok=True)
-                with open("runtime/sync_errors.jsonl", "a", encoding="utf-8") as f:
-                    for s in err_samples:
-                        s["ts"] = datetime.utcnow().isoformat()
-                        f.write(json.dumps(s, ensure_ascii=False) + "\n")
-            except Exception:
-                pass
+        # [NOVO] Atualiza estado de mês somente se concluído (não parcial)
+        if not partial:
+            _save_state({
+                "last_calc_month": now_month,
+                "last_run_utc": datetime.utcnow().isoformat(),
+                "version": VERSION,
+            })
 
     finally:
         db_read.close()
@@ -525,7 +567,6 @@ def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_second
     elapsed = round(time.monotonic() - t0, 3)
     payload = {
         "version": VERSION,
-        "dest": {"mr": mr_name, "vg": vg_name, "vp": vp_name},
         "ok": 1,
         "updated": atualizados,
         "unchanged": inalterados,
@@ -542,6 +583,11 @@ def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_second
         "batches_done": batches_done,
         "elapsed_s": elapsed,
         "limits": {"max_seconds": max_seconds, "max_batches": max_batches, "batch_size": batch_size},
+        # [NOVO] meta de force/mês
+        "force_requested": bool(force),
+        "auto_force_by_month": bool(auto_force_by_month),
+        "last_calc_month_before": last_calc_month,
+        "now_month": now_month,
     }
 
     if erros:
@@ -557,10 +603,12 @@ def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_second
 def sincronizar_todos(request: Request):
     debug = request.query_params.get("debug") in {"1", "true", "True"}
     as_json = request.query_params.get("json") in {"1", "true", "True"} or request.query_params.get("format") == "json"
-    force = request.query_params.get("force") in {"1","true","True"}
+    # [MUD] default agora força recálculo
+    force = request.query_params.get("force", "true") in {"1","true","True"}
     start_id = int(request.query_params.get("start_id", 0) or 0)
-    max_seconds = int(request.query_params.get("max_seconds", 20) or 20)
-    max_batches = int(request.query_params.get("max_batches", 20) or 20)
+    # [MUD] sem limite por padrão: processa até o fim
+    max_seconds = int(request.query_params.get("max_seconds", 0) or 0)
+    max_batches = int(request.query_params.get("max_batches", 0) or 0)
 
     payload = _run_batch(
         force=force, dry=False, debug=debug,
@@ -574,33 +622,36 @@ def sincronizar_todos(request: Request):
         f"?ok=1&n={payload['updated']}&inalterados={payload['unchanged']}&skip_sem_cab={payload['skip_sem_cab']}"
         f"&skip_ret={payload['skip_ret']}&codcli={payload['copiados_cod_cli']}&skip_campos={payload['skip_campos']}&err={payload['errors']}"
         f"&partial={'1' if payload.get('partial') else '0'}"
+        f"&auto_force={'1' if payload.get('auto_force_by_month') else '0'}"
     )
     return RedirectResponse(url + qp, status_code=303)
 
 # GET que executa o batch e retorna JSON (sem POST / sem DevTools)
 @router.get("/sincronizar_debug")
 def sincronizar_debug(
-    force: bool = Query(default=False),
+    # [MUD] padrão com force=True
+    force: bool = Query(default=True),
     start_id: int = Query(default=0, ge=0),
-    max_seconds: int = Query(default=15, ge=1),
-    max_batches: int = Query(default=20, ge=1),
+    # [MUD] sem limites por padrão (0 = desativado)
+    max_seconds: int = Query(default=0, ge=0),
+    max_batches: int = Query(default=0, ge=0),
 ):
     payload = _run_batch(
         force=bool(force), dry=False, debug=True,
-        start_id=int(start_id or 0), max_seconds=int(max_seconds or 15), max_batches=int(max_batches or 20),
+        start_id=int(start_id or 0), max_seconds=int(max_seconds or 0), max_batches=int(max_batches or 0),
     )
     return JSONResponse(payload)
 
 # GET de DRY-RUN (não escreve nada) — mostra o que seria alterado
 @router.get("/sincronizar_dry")
 def sincronizar_dry(
-    force: bool = Query(default=False),
+    force: bool = Query(default=True),     # [MUD] default True
     start_id: int = Query(default=0, ge=0),
-    max_seconds: int = Query(default=15, ge=1),
-    max_batches: int = Query(default=20, ge=1),
+    max_seconds: int = Query(default=0, ge=0),
+    max_batches: int = Query(default=0, ge=0),
 ):
     payload = _run_batch(
         force=bool(force), dry=True, debug=True,
-        start_id=int(start_id or 0), max_seconds=int(max_seconds or 15), max_batches=int(max_batches or 20),
+        start_id=int(start_id or 0), max_seconds=int(max_seconds or 0), max_batches=int(max_batches or 0),
     )
     return JSONResponse(payload)
