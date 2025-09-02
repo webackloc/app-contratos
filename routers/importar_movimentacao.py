@@ -1,28 +1,35 @@
 # routers/importar_movimentacao.py
-# Versão: 2.5.2
-# Data: 26/08/2025
+# Versão: 2.6.0
+# Data: 02/09/2025
 #
 # MUDANÇAS NESTA VERSÃO:
-# - [2.5.2] Pós-commit "fixup": após aplicar_lote, preenche nos itens (Contrato)
-#   campos em branco: numero do contrato, cod_cli, data_envio, valor_mensal e
-#   periodo_contratual (via ContratoCabecalho). Grava esse resumo em runtime/ultima_importacao.json.
-# - Mantém toda a lógica anterior de preview/commit, trocas, idempotência e escrita do arquivo.
+# - [2.6.0] Validação pró-ativa no PREVIEW:
+#   * Resolve e anexa cabecalho_id_resolvido no payload quando existir.
+#   * Marca ERRO se o cabeçalho não for encontrado (mensagem compatível).
+#   * Em RETORNO, verifica existência de item ativo compatível; caso contrário,
+#     marca ERRO ("RETORNO sem item ATIVO para '<ativo>'.").
+#   * Em TROCA com par completo, valida se o item antigo existe/está ativo antes
+#     de aceitar; registra flag em payload.
+# - Mantida a lógica 2.5.2 de metacampos (TROCA por OS, idempotência por hash)
+#   e o fix pós-commit (_post_commit_fixup).
 #
 # HISTÓRICO (principal):
-# - 2.5.0: (sua base) TROCA em 2 linhas, metacampos canônicos no payload, idempotência por hash,
-#          gravação de runtime/ultima_importacao.json, preview/commit/lote.
+# - 2.5.2: Pós-commit "fixup" preenchendo campos faltantes no Contrato e
+#   gravando runtime/ultima_importacao.json.
+# - 2.5.0: TROCA em 2 linhas, metacampos canônicos, idempotência por hash,
+#   preview/commit/lote.
 # - 2.4.x: Robustez em nomes de colunas, pareamento por OS, etc.
 
 from typing import List, Dict, Any, Optional, Tuple, DefaultDict
 from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy import select
+from sqlalchemy import select, and_, or_
 from database import get_db
 
 from services.movimentacao_service import aplicar_lote
 from utils.mov_utils import parse_data_mov, norm_tp, make_mov_hash
-# ⬇️ acrescenta Contrato e ContratoCabecalho para o fix pós-commit
+# ⬇️ acrescenta Contrato e ContratoCabecalho para o fix pós-commit e validações
 from models import MovimentacaoLote, MovimentacaoItem, ContratoLog, Contrato, ContratoCabecalho
 
 import os, json
@@ -54,7 +61,7 @@ _TROCA_ROLE_KEYS = [
     "mov_troca",
     "tipo_troca",
 ]
-_CONTRATO_NUM_KEYS = ["contrato_num", "contrato_n", "contrato", "n_contrato"]
+_CONTRATO_NUM_KEYS = ["contrato_num", "contrato_n", "contrato", "n_contrato", "numero_contrato", "numero"]
 _COD_CLI_KEYS = ["cod_cli", "codigo_cliente", "cliente", "cod_cliente"]
 _ATIVO_KEYS = ["ativo", "serial", "numero_serie", "n_serie"]
 
@@ -98,9 +105,69 @@ def _troca_pair_key(row: Dict[str, Any]) -> Tuple[str, str, str]:
     os_num = _get_os(row)
     return (contrato_num, cod_cli, os_num)
 
+# -------------------- RESOLUÇÃO DE CABEÇALHO E CONTRATO ATIVO --------------------
+
+def _pick_attr(obj_or_cls, *names):
+    """Retorna o primeiro nome de atributo existente, senão None."""
+    for n in names:
+        if hasattr(obj_or_cls, n):
+            return n
+    return None
+
+def _resolver_cabecalho_id(db, contrato_num: str, cod_cli: str) -> Optional[int]:
+    """
+    Tenta localizar o ContratoCabecalho por número (e cod_cli, se existir no modelo).
+    Retorna ID se encontrar, senão None.
+    """
+    if not contrato_num:
+        return None
+
+    # Tenta diferentes nomes de campo para número do contrato
+    num_field = _pick_attr(ContratoCabecalho, "contrato_num", "contrato_n", "numero", "numero_contrato")
+    if not num_field:
+        return None
+
+    q = db.query(ContratoCabecalho).filter(getattr(ContratoCabecalho, num_field) == contrato_num)
+
+    # Se existir cod_cli no cabeçalho, filtra também
+    if _pick_attr(ContratoCabecalho, "cod_cli"):
+        q = q.filter(getattr(ContratoCabecalho, "cod_cli") == cod_cli)
+
+    cab = q.first()
+    return getattr(cab, "id", None) if cab else None
+
+def _existe_contrato_ativo(db, ativo: str, cabecalho_id: Optional[int]) -> bool:
+    """
+    Verifica a existência de um item de Contrato "ativo" para RETORNO/TROCA.
+    Tenta usar 'status'='ATIVO' se o campo existir; fallback para 'data_retorno is null';
+    fallback final: existência de qualquer contrato com o mesmo ativo (menos preciso).
+    """
+    if not ativo:
+        return False
+
+    q = db.query(Contrato).filter(getattr(Contrato, "ativo") == ativo)
+
+    if cabecalho_id and _pick_attr(Contrato, "cabecalho_id", "contrato_cabecalho_id"):
+        q = q.filter(or_(
+            getattr(Contrato, "cabecalho_id", None) == cabecalho_id if hasattr(Contrato, "cabecalho_id") else False,
+            getattr(Contrato, "contrato_cabecalho_id", None) == cabecalho_id if hasattr(Contrato, "contrato_cabecalho_id") else False
+        ))
+
+    status_attr = _pick_attr(Contrato, "status")
+    data_retorno_attr = _pick_attr(Contrato, "data_retorno")
+
+    if status_attr:
+        q = q.filter(getattr(Contrato, "status") == "ATIVO")
+    elif data_retorno_attr:
+        q = q.filter(getattr(Contrato, "data_retorno") == None)  # noqa: E711
+
+    return db.query(q.exists()).scalar() or False
+
+# -------------------------------------------------------------------------------
+
 @router.get("/version")
 def version():
-    return {"router": "importar_movimentacao", "version": "2.5.2", "date": "2025-08-26"}
+    return {"router": "importar_movimentacao", "version": "2.6.0", "date": "2025-09-02"}
 
 def _prepair_trocas(linhas: List[Dict[str, Any]]) -> Dict[Tuple[str, str, str], Dict[str, Dict[str, Any]]]:
     """
@@ -134,6 +201,8 @@ def _validar_linha_preview(
       - ativo obrigatório exceto em TROCA (usaremos o par)
       - TROCA: exige OS e papel válido (ENVIO/RETORNO); quando par completo, resolve ativos e
                gera hash único para o evento; senão, gera hash provisório.
+      - [2.6.0] Resolve cabecalho_id_resolvido; marca ERRO se não houver cabeçalho.
+      - [2.6.0] Em RETORNO, exige existência de item ativo compatível.
     """
     erros: List[str] = []
     avisos: List[str] = []
@@ -160,6 +229,18 @@ def _validar_linha_preview(
     if not cod_cli:
         erros.append("cod_cli (ou código do cliente) obrigatório.")
 
+    # [2.6.0] Resolve cabeçalho desde já
+    cabecalho_id_resolvido: Optional[int] = None
+    if contrato_num and cod_cli:
+        try:
+            cabecalho_id_resolvido = _resolver_cabecalho_id(db, contrato_num, cod_cli)
+        except Exception:
+            cabecalho_id_resolvido = None
+
+    if cabecalho_id_resolvido is None:
+        # Mantém mensagem compatível com o que o serviço retornava, para UX igual
+        erros.append(f"Cabeçalho não encontrado para contrato='{contrato_num}'. (cod_cli '{cod_cli}' ignorado)")
+
     mov_hash: Optional[str] = None
     extras: Dict[str, Any] = {
         "tp_norm": tp_norm,
@@ -168,8 +249,11 @@ def _validar_linha_preview(
         "os_norm": os_num,
         "ativo_norm": ativo,
         "data_mov_iso": data_mov_iso,
+        # [2.6.0] novo metadado
+        "cabecalho_id_resolvido": cabecalho_id_resolvido,
     }
 
+    # ---------------------- TROCA ----------------------
     if tp_norm == "TROCA":
         papel = _get_troca_role(row)
 
@@ -196,6 +280,11 @@ def _validar_linha_preview(
                     erros.append("TROCA: linha ENVIO do par não possui 'ativo/serial' (novo).")
                 if not ativo_antigo:
                     erros.append("TROCA: linha RETORNO do par não possui 'ativo/serial' (antigo).")
+
+                # [2.6.0] se cabeçalho resolvido e temos ativo_antigo, valide existência do contrato "ativo"
+                if cabecalho_id_resolvido and ativo_antigo:
+                    if not _existe_contrato_ativo(db, ativo_antigo, cabecalho_id_resolvido):
+                        erros.append(f"TROCA: item antigo '{ativo_antigo}' não está ATIVO para este cabeçalho.")
 
                 extras.update({
                     "troca_pair_status": "PAR_COMPLETO",
@@ -241,8 +330,8 @@ def _validar_linha_preview(
             if dup:
                 avisos.append("Duplicado (hash da TROCA) — será IGNORADO no commit.")
 
+    # ----------------- ENVIO / RETORNO -----------------
     else:
-        # ENVIO/RETORNO “simples”
         if not ativo:
             erros.append("ativo/serial obrigatório.")
         if not erros and data_mov_dt:
@@ -257,6 +346,11 @@ def _validar_linha_preview(
             if dup:
                 avisos.append("Duplicado (hash) — esta linha será IGNORADA no commit.")
 
+        # [2.6.0] Em RETORNO, exija existência de item ativo:
+        if tp_norm == "RETORNO" and not erros and cabecalho_id_resolvido:
+            if not _existe_contrato_ativo(db, ativo, cabecalho_id_resolvido):
+                erros.append(f"RETORNO sem item ATIVO para '{ativo}'.")
+
     severidade = SEVERIDADE_ERRO if erros else (SEVERIDADE_AVISO if avisos else SEVERIDADE_OK)
     return {"severidade": severidade, "erros": erros, "avisos": avisos, "mov_hash": mov_hash, **extras}
 
@@ -269,6 +363,7 @@ def preview_lote(
     Cria um lote de pré-importação com validação por linha.
     Para TROCA (duas linhas por OS): pareia por OS e inclui no payload o status do par
     e os ativos resolvidos (antigo/novo) quando possível.
+    [2.6.0] Inclui cabecalho_id_resolvido quando encontrado e validações adicionais.
     """
     if not linhas:
         raise HTTPException(status_code=400, detail="Nenhuma linha recebida.")
@@ -305,6 +400,8 @@ def preview_lote(
                     "os_norm": meta.get("os_norm"),
                     "ativo_norm": meta.get("ativo_norm"),
                     "data_mov_iso": meta.get("data_mov_iso"),
+                    # [2.6.0]
+                    "cabecalho_id_resolvido": meta.get("cabecalho_id_resolvido"),
                 })
                 # extras do meta (troca)
                 for k in (
@@ -340,14 +437,7 @@ def preview_lote(
     except SQLAlchemyError as e:
         raise HTTPException(status_code=500, detail=f"Erro de banco: {e.__class__.__name__}")
 
-# ----------------- v2.5.2: helpers fix pós-commit ----------------------------
-
-def _pick_attr(obj, *names):
-    """Retorna o primeiro nome de atributo existente em obj, senão None."""
-    for n in names:
-        if hasattr(obj, n):
-            return n
-    return None
+# ----------------- helpers fix pós-commit (mantidos de 2.5.2) -------------------
 
 def _parse_money(val):
     """Converte '1.234,56' ou '1234.56' → float. Retorna None se não parsear."""
@@ -368,6 +458,13 @@ def _db_get(db, Model, pk):
     except Exception:
         # modo legacy
         return db.query(Model).get(pk)
+
+def _pick_attr(obj, *names):
+    """Retorna o primeiro nome de atributo existente em obj, senão None."""
+    for n in names:
+        if hasattr(obj, n):
+            return n
+    return None
 
 def _post_commit_fixup(db, lote_id: int) -> dict:
     """
@@ -491,7 +588,7 @@ def commit_lote(lote_id: int, db=Depends(get_db)):
       - TROCA: usar payload (ativo_antigo_resolvido, ativo_novo_resolvido, troca_pair_status, troca_chave);
                somente consolidar quando PAR_COMPLETO (hash único).
       - Idempotência por mov_hash (linhas duplicadas ⇒ ignoradas).
-    Ao final: grava runtime/ultima_importacao.json com resumo + 'fixup' v2.5.2.
+    Ao final: grava runtime/ultima_importacao.json com resumo + 'fixup'.
     """
     try:
         with db.begin():
@@ -499,7 +596,7 @@ def commit_lote(lote_id: int, db=Depends(get_db)):
     except SQLAlchemyError as e:
         raise HTTPException(status_code=500, detail=f"Erro ao aplicar lote: {e.__class__.__name__}")
 
-    # 🔧 v2.5.2: Fix pós-commit (fora do with begin, com commit próprio)
+    # Fix pós-commit (fora do with begin, com commit próprio)
     try:
         fix = _post_commit_fixup(db, lote_id)
     except Exception:
@@ -521,8 +618,8 @@ def commit_lote(lote_id: int, db=Depends(get_db)):
             "atualizados": int(resultado.get("atualizados", 0)),
             "trocas": int(resultado.get("trocas", 0)),
             "retornos": int(resultado.get("retornos", 0)),
-            "router_version": "2.5.2",
-            "fixup": fix,  # resumo do ajuste pós-commit
+            "router_version": "2.6.0",
+            "fixup": fix,
         }
         with open(ULTIMO_JSON, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -572,4 +669,4 @@ def obter_lote(lote_id: int, db=Depends(get_db)):
     except SQLAlchemyError as e:
         raise HTTPException(status_code=500, detail=f"Erro de banco: {e.__class__.__name__}")
 
-# Fim do arquivo - v2.5.2
+# Fim do arquivo - v2.6.0
