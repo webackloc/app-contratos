@@ -1,14 +1,22 @@
 # services/movimentacao_service.py
-# Versão: 4.3.0 (2025-08-27)
-# Novidades desta versão:
-# - Garante que **o número do contrato** também seja gravado no item (se existir um campo compatível no modelo).
-# - Período do contrato herdado do cabeçalho ainda mais robusto:
-#   - copia datas (início/fim) para múltiplas variações de nomes de coluna no item;
-#   - copia "periodo" textual, "prazo_contratual", "meses_contrato" ou "tempo_contrato" (se existirem no item).
-# - Mantém idempotência por mov_hash e reaplica somente quando necessário.
-# - Sem mudanças de schema.
+# Versão: 4.5.0 (2025-09-02)
 #
-# Histórico: ver 4.2.x nas versões anteriores.
+# NOVIDADES (desde 4.3.0):
+# - [FIX] Troca de "delete físico" por SOFT DELETE em ENVIO: itens existentes com mesmo
+#   "ativo" são marcados como RETORNADO (status/data_retorno) em vez de remover do banco.
+#   Isso elimina o IntegrityError por FK em contratos_logs e preserva histórico.
+# - [IMP] Usa cabecalho_id_resolvido vindo do preview (quando presente), evitando buscas
+#   repetidas e removendo fonte de DetachedInstanceError.
+# - [IMP] Cacheia apenas IDs de cabeçalho (não objetos ORM), e sempre reobtém via sess.get().
+# - [IMP] Herdar data_envio do item que retorna ao fazer TROCA, e setar data_troca no novo.
+# - [IMP] Proteções adicionais para campos opcionais (descricao_produto, etc.).
+#
+# Mantém:
+# - Idempotência por mov_hash e reaplicação inteligente.
+# - Cópia de período e meta-campos do cabeçalho para o item.
+# - Compatibilidade com modelos de coluna variados (detecção heurística).
+#
+# Histórico anterior (4.3.0): ver arquivo anterior.
 
 from __future__ import annotations
 
@@ -17,7 +25,7 @@ import calendar
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import and_, select, delete
+from sqlalchemy import and_, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.inspection import inspect as sa_inspect
 from sqlalchemy.exc import SQLAlchemyError
@@ -31,10 +39,13 @@ from models import (
 )
 from utils.mov_utils import norm_tp, parse_data_mov, make_mov_hash
 
-# cache de cabeçalhos por chave (contrato_num[, cod_cli])
-_CAB_CACHE: Dict[Tuple[str, Optional[str]], Optional[ContratoCabecalho]] = {}
+# -------------------------------------------------------------------
+# Cache de cabeçalhos por chave (contrato_num[, cod_cli]) -> ID (ou None)
+# (não cacheia objetos ORM para evitar DetachedInstanceError)
+_CAB_ID_CACHE: Dict[Tuple[str, Optional[str]], Optional[int]] = {}
 
-# ------------------------------ util ------------------------------
+
+# ------------------------------ utils ---------------------------------
 
 def _as_str(v: Any) -> str:
     return (str(v) if v is not None else "").strip()
@@ -99,6 +110,7 @@ def _detect_cli_col(model):
         or getattr(model, "cliente_id", None)
         or getattr(model, "id_cliente", None)
     )
+
 
 # ---------------------- datas / período ---------------------------
 
@@ -176,6 +188,7 @@ def _set_periodo_on_item(item: Contrato, ini: date | None, fim: date | None):
                 setattr(item, t, fim)
                 break
 
+
 # ---------------------- números/moedas do arquivo ------------------
 
 def _parse_decimal_br(val: Any) -> Optional[float]:
@@ -228,12 +241,30 @@ def _coerce_for_column(value: Any, column_attr):
     except Exception:
         return value
 
-# --------------------- cabeçalho: SOMENTE LEITURA ------------------
+
+# --------------------- cabeçalho (via ID resolvido) -----------------
+
+def _cabecalho_from_payload(sess: Session, row: Dict[str, Any]) -> Optional[ContratoCabecalho]:
+    """
+    Se o preview já colocou 'cabecalho_id_resolvido', usa ele (mais rápido e seguro).
+    """
+    cid = row.get("cabecalho_id_resolvido")
+    try:
+        cid_int = int(cid) if cid is not None and str(cid).strip() != "" else None
+    except Exception:
+        cid_int = None
+    if cid_int:
+        return sess.get(ContratoCabecalho, cid_int)
+    return None
 
 def _find_cabecalho(sess: Session, contrato_num: str, cod_cli: Optional[str]) -> Optional[ContratoCabecalho]:
-    cache_key = (str(contrato_num), _as_str(cod_cli) or None)
-    if cache_key in _CAB_CACHE:
-        return _CAB_CACHE[cache_key]
+    """
+    Busca por número (e cod_cli se existir no modelo). Cacheia apenas o ID.
+    """
+    key = (str(contrato_num), _as_str(cod_cli) or None)
+    if key in _CAB_ID_CACHE:
+        cid = _CAB_ID_CACHE[key]
+        return sess.get(ContratoCabecalho, cid) if cid else None
 
     contrato_col = (
         _get_model_col_by_keywords(ContratoCabecalho, [["contrato","num"], ["contrato","numero"], ["num","contrato"], ["numero","contrato"], ["contrato","id"]])
@@ -263,15 +294,18 @@ def _find_cabecalho(sess: Session, contrato_num: str, cod_cli: Optional[str]) ->
                 .first()
             )
 
-    _CAB_CACHE[cache_key] = cab
+    _CAB_ID_CACHE[key] = getattr(cab, "id", None) if cab else None
     return cab
 
-def _require_cabecalho(sess: Session, contrato_num: str, cod_cli: Optional[str]) -> ContratoCabecalho:
-    cab = _find_cabecalho(sess, contrato_num, cod_cli)
+def _require_cabecalho(sess: Session, row: Dict[str, Any], contrato_num: str, cod_cli: Optional[str]) -> ContratoCabecalho:
+    cab = _cabecalho_from_payload(sess, row)
+    if not cab:
+        cab = _find_cabecalho(sess, contrato_num, cod_cli)
     if not cab:
         extra = f" (cod_cli '{cod_cli}' ignorado)" if (cod_cli is not None and _as_str(cod_cli) != "") else ""
         raise ValueError(f"Cabeçalho não encontrado para contrato='{contrato_num}'." + extra)
     return cab
+
 
 # --------- helpers: número do contrato ----------------------------
 
@@ -304,6 +338,7 @@ def _apply_contrato_num_on_item(item: Contrato, contrato_num: Optional[str]) -> 
                 break
             except Exception:
                 pass
+
 
 # --------- período (string / meta) a partir do cabeçalho ------------
 
@@ -353,6 +388,7 @@ def _periodo_fields_from_cab(cab: ContratoCabecalho) -> Dict[str, Any]:
             out["indice_reajuste"] = ir
 
     return out
+
 
 # --------------------------- operações ----------------------------
 
@@ -415,14 +451,33 @@ def _ensure_min_fields(model, data: Dict[str, Any], minimo: Dict[str, Any]) -> D
             data[k] = v
     return data
 
-def _pre_delete_envio(sess: Session, ativo: str) -> int:
+def _soft_close_itens_por_ativo(sess: Session, ativo: str, data_retorno: date) -> int:
+    """
+    SOFT DELETE: fecha itens com mesmo 'ativo' marcando RETORNADO + data_retorno.
+    Retorna quantos itens foram atualizados.
+    """
     if not ativo:
         return 0
-    q = sess.query(Contrato).filter(Contrato.ativo == ativo)
-    count = q.count()
-    if count:
-        q.delete(synchronize_session=False)
-    return count
+
+    set_values = {}
+    if hasattr(Contrato, "status"):
+        set_values["status"] = "RETORNADO"
+    if hasattr(Contrato, "data_retorno"):
+        set_values["data_retorno"] = data_retorno
+    if hasattr(Contrato, "tp_transacao"):
+        set_values["tp_transacao"] = "RETORNO"
+
+    if not set_values:
+        # Sem colunas para soft close; não faz nada.
+        return 0
+
+    stmt = (
+        update(Contrato)
+        .where(Contrato.ativo == ativo)
+        .values(**set_values)
+    )
+    res = sess.execute(stmt)
+    return int(res.rowcount or 0)
 
 def _envio(
     sess: Session,
@@ -434,7 +489,7 @@ def _envio(
     override_data_envio: Optional[date] = None,
     data_troca: Optional[date] = None,
 ) -> Contrato:
-    serial = _row_get_str(row, "serial") or None
+    serial = _row_get_str(row, "serial", "ativo_serial") or None
 
     # campos “textuais/meta” derivados do cabeçalho (se existirem no modelo do item)
     derivados = _periodo_fields_from_cab(cab)
@@ -450,14 +505,14 @@ def _envio(
         ativo=row["ativo"],
         serial=serial,
         cod_pro=row.get("cod_pro"),
-        descricao_produto=row.get("descricao_produto"),
+        descricao_produto=row.get("descricao_produto") or row.get("descricao") or row.get("descricao_item"),
         cod_cli=row.get("cod_cli"),
         nome_cli=row.get("nome_cli"),
         valor_mensal=valor_mensal_val,
         data_envio=(override_data_envio or data_mov.date()),
-        tp_transacao="ENVIO",
+        tp_transacao="ENVIO" if hasattr(Contrato, "tp_transacao") else None,
         status="ATIVO" if hasattr(Contrato, "status") else None,
-        mov_hash=mov_hash,
+        mov_hash=mov_hash if hasattr(Contrato, "mov_hash") else None,
         **derivados,
     )
     raw_kwargs = {k: v for k, v in raw_kwargs.items() if v is not None}
@@ -501,6 +556,7 @@ def _retorno(sess: Session, row: Dict[str, Any], cab: ContratoCabecalho, data_mo
     sess.flush()
     return aberto
 
+
 # ----------------------- leitura canônica row ----------------------
 
 def _canon(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -520,6 +576,7 @@ def _fmt_exc(e: BaseException) -> str:
         except Exception:
             pass
     return msg
+
 
 # ----------------------------- lote -------------------------------
 
@@ -581,7 +638,7 @@ def aplicar_lote(sess: Session, lote_id: int) -> Dict[str, Any]:
                 if not tp or not contrato_num or not ativo:
                     raise ValueError("Campos obrigatórios: tp_transacao, contrato_num, ativo (cod_cli opcional).")
 
-                cab = _require_cabecalho(sess, contrato_num, cod_cli or None)
+                cab = _require_cabecalho(sess, row, contrato_num, cod_cli or None)
                 data_iso = data_mov.date().isoformat()
                 mov_hash = make_mov_hash(contrato_num, cod_cli, tp, ativo, data_iso, "")
 
@@ -590,21 +647,23 @@ def aplicar_lote(sess: Session, lote_id: int) -> Dict[str, Any]:
                 if dup:
                     precisa_reaplicar = False
                     if tp == "ENVIO":
-                        # Reaplica se NÃO existe item ATIVO para esse ativo (foi apagado ou fechado)
+                        # Reaplica se NÃO existe item ATIVO para esse ativo (foi fechado)
                         precisa_reaplicar = (_find_item_aberto(sess, cab.id, cod_cli, ativo) is None)
                     elif tp == "RETORNO":
                         # Reaplica se AINDA existe item ATIVO para esse ativo
                         precisa_reaplicar = (_find_item_aberto(sess, cab.id, cod_cli, ativo) is not None)
 
-                    if precisa_reaplicar:
-                        sess.execute(delete(ContratoLog).where(ContratoLog.mov_hash == mov_hash))
-                    else:
+                    if not precisa_reaplicar:
                         it.erro_msg = ""  # duplicado silencioso
                         ok += 1  # conta como ok/idempotente
                         continue
+                    else:
+                        # Em vez de apagar logs, adicionamos um novo log consistente (histórico preservado).
+                        pass
 
                 if tp == "ENVIO":
-                    _pre_delete_envio(sess, ativo)
+                    # SOFT CLOSE de quaisquer itens existentes com mesmo ativo
+                    _soft_close_itens_por_ativo(sess, ativo, data_mov.date())
                     _envio(sess, {"cod_cli": cod_cli, "ativo": ativo, **row}, cab, data_mov, mov_hash)
                 elif tp == "RETORNO":
                     _retorno(sess, {"cod_cli": cod_cli, "ativo": ativo, **row}, cab, data_mov, mov_hash)
@@ -657,7 +716,8 @@ def aplicar_lote(sess: Session, lote_id: int) -> Dict[str, Any]:
                     or _row_get_str(envio_row, "data_mov", "data", "data_movimento")
                 )
 
-                cab = _require_cabecalho(sess, contrato_num, cod_cli or None)
+                # Cabeçalho por payload resolvido (quando houver), senão busca por número
+                cab = _require_cabecalho(sess, envio_row, contrato_num, cod_cli or None)
                 data_iso = data_mov.date().isoformat()
 
                 # Captura a data_envio do item que vai retornar (antes de fechar), para herdar no ENVIO
@@ -670,9 +730,6 @@ def aplicar_lote(sess: Session, lote_id: int) -> Dict[str, Any]:
                 # RETORNO - reprocessa se ainda houver item ativo
                 dup_ret = sess.execute(select(ContratoLog.id).where(ContratoLog.mov_hash == h_ret)).first()
                 ainda_ativo_ret = _find_item_aberto(sess, cab.id, (cod_cli or _row_get_str(retorno_row, "cod_cli", "cliente", "cod_cliente")), ativo_retorno) is not None
-                if dup_ret and ainda_ativo_ret:
-                    sess.execute(delete(ContratoLog).where(ContratoLog.mov_hash == h_ret))
-
                 if not dup_ret or ainda_ativo_ret:
                     _retorno(sess, {"cod_cli": (cod_cli or _row_get_str(retorno_row, "cod_cli", "cliente", "cod_cliente")), "ativo": ativo_retorno, **retorno_row}, cab, data_mov, h_ret)
                     sess.add(ContratoLog(
@@ -687,14 +744,12 @@ def aplicar_lote(sess: Session, lote_id: int) -> Dict[str, Any]:
                     ))
                     sess.flush()
 
-                # ENVIO - reprocessa se não houver item ativo
+                # ENVIO - reprocessa se não houver item ativo (após retorno, em geral não haverá)
                 dup_env = sess.execute(select(ContratoLog.id).where(ContratoLog.mov_hash == h_env)).first()
                 ainda_ativo_env = _find_item_aberto(sess, cab.id, (cod_cli or _row_get_str(envio_row, "cod_cli", "cliente", "cod_cliente")), ativo_envio) is not None
-                if dup_env and not ainda_ativo_env:
-                    sess.execute(delete(ContratoLog).where(ContratoLog.mov_hash == h_env))
-
                 if not dup_env or not ainda_ativo_env:
-                    _pre_delete_envio(sess, ativo_envio)
+                    # SOFT CLOSE para qualquer item existente com este ativo novo (segurança)
+                    _soft_close_itens_por_ativo(sess, ativo_envio, data_mov.date())
                     _envio(
                         sess,
                         {"cod_cli": (cod_cli or _row_get_str(envio_row, "cod_cli", "cliente", "cod_cliente")), "ativo": ativo_envio, **envio_row},
