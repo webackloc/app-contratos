@@ -1,15 +1,11 @@
 # =============================================================================
 # routers/contratos_sync.py
-# Versão: v2.5.0 (2025-09-02)
+# Versão: v2.7.0 (2025-09-02)
 #
-# Novidades nesta versão:
-# - [MUD] Recalcula SEMPRE por padrão (force=True) quando acionado.
-# - [NOVO] Auto-force por virada de mês: se o mês do último cálculo (estado)
-#   for diferente do mês atual, o batch é forçado automaticamente.
-# - [NOVO] Persistência leve do estado em runtime/contratos_sync_state.json:
-#   guarda last_calc_month="YYYY-MM" e meta de execução.
-# - [MANTIDO] Toda a estrutura anterior (timebox, start_id, dry-run, export,
-#   diagnósticos, mapeamentos de colunas e cálculos) permanece funcional.
+# Novidades x v2.6.1:
+# - [FIX CRÍTICO] Hidrata periodo_contratual do item a partir do ContratoCabecalho
+#   quando o campo do item está vazio/zero, ANTES dos cálculos.
+# - [KEEP] Recalcula sempre; auto-force por virada de mês; estrutura original.
 # =============================================================================
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
@@ -33,7 +29,7 @@ from io import StringIO, BytesIO
 from datetime import datetime, date
 import json, os, logging, re, time
 
-VERSION = "v2.5.0"
+VERSION = "v2.7.0"
 log = logging.getLogger("uvicorn.error")
 log.info("[contratos_sync] carregado %s", VERSION)
 
@@ -54,6 +50,12 @@ def _pick_attr(model, *names):
 def _first_existing_name(model, names):
     for n in names:
         if hasattr(model, n):
+            return n
+    return None
+
+def _first_existing_name_instance(obj, names):
+    for n in names:
+        if hasattr(obj, n):
             return n
     return None
 
@@ -135,17 +137,17 @@ def _is_retornado(item) -> bool:
 
 # --------- Estado do batch (virada de mês) ---------
 
-RUNTIME_DIR = "runtime"            # [NOVO]
-STATE_FILE = os.path.join(RUNTIME_DIR, "contratos_sync_state.json")  # [NOVO]
+RUNTIME_DIR = "runtime"
+STATE_FILE = os.path.join(RUNTIME_DIR, "contratos_sync_state.json")
 
-def _load_state() -> dict:  # [NOVO]
+def _load_state() -> dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
-def _save_state(d: dict):  # [NOVO]
+def _save_state(d: dict):
     try:
         os.makedirs(RUNTIME_DIR, exist_ok=True)
         tmp = dict(d or {})
@@ -154,7 +156,7 @@ def _save_state(d: dict):  # [NOVO]
     except Exception:
         pass
 
-def _month_key(dt: datetime | None = None) -> str:  # [NOVO]
+def _month_key(dt: datetime | None = None) -> str:
     dt = dt or datetime.utcnow()
     return dt.strftime("%Y-%m")
 
@@ -209,7 +211,7 @@ def contratos_view(
     rows = q_rows.offset(offset).limit(per_page).all()
 
     # KPIs
-    mr_colname = _first_existing_name(Contrato, ["meses_restantes","meses_rest","meses_restante"]) or "meses_restantes"
+    mr_colname = _first_existing_name(Contrato, ["meses_restantes","meses_rest","meses_restante","mes_rest"]) or "meses_restantes"
     sq = q_base.with_entities(
         cast(Contrato.valor_mensal, Numeric).label("vm"),
         cast(getattr(Contrato, mr_colname), Numeric).label("mr"),
@@ -242,20 +244,16 @@ def contratos_view(
 
 @router.get("/_diag")
 def diagnostico(db: Session = Depends(get_db)):
-    mr_name = _first_existing_name(Contrato, ["meses_restantes", "meses_rest", "meses_restante"]) or None
+    mr_name = _first_existing_name(Contrato, ["meses_restantes", "meses_rest", "meses_restante", "mes_rest"]) or None
     vg_name = _first_existing_name(Contrato, ["valor_global_contrato", "valor_global", "valor_global_total", "valor_total"]) or None
     vp_name = _first_existing_name(Contrato, ["valor_presente_contrato", "valor_presente", "valor_presente_total", "valor_presente_backlog", "backlog", "backlog_total"]) or None
-    total = db.query(func.count(getattr(Contrato, 'id'))).scalar() if hasattr(Contrato, 'id') else None
-    # [NOVO] estado de mês
+    total = db.query(func.count(getattr(Contrato, 'id'))).scalar() if hasattr(Contrato, 'id') else 0
     st = _load_state()
     return JSONResponse({
         "version": VERSION,
         "dest": {"mr": mr_name, "vg": vg_name, "vp": vp_name},
         "total_contratos": int(total or 0),
-        "estado": {
-            "last_calc_month": st.get("last_calc_month"),
-            "now_month": _month_key(),
-        },
+        "estado": {"last_calc_month": st.get("last_calc_month"), "now_month": _month_key()},
     })
 
 # ------------------ EXPORTAÇÃO ------------------
@@ -273,7 +271,6 @@ def exportar_contratos(
     limit: int = Query(50000, ge=1, le=200000),
 ):
     q = db.query(Contrato)
-    q = q.filter(True)  # placeholder
     if cliente and hasattr(Contrato, "nome_cli"):
         q = q.filter(_ilike_ci(Contrato.nome_cli, cliente))
     if contrato:
@@ -283,7 +280,6 @@ def exportar_contratos(
         q = q.filter(_ilike_ci(col, contrato))
     if ativo and hasattr(Contrato, "ativo"):
         q = q.filter(_ilike_ci(Contrato.ativo, ativo))
-
     if not incluir_retornados:
         if hasattr(Contrato, "status"):
             q = q.filter(or_(Contrato.status.is_(None), func.upper(Contrato.status) != "RETORNADO"))
@@ -297,7 +293,7 @@ def exportar_contratos(
         contrato_num = getattr(c, "contrato_num", getattr(c, "contrato_n", None))
         data_envio = getattr(c, "data_envio", None)
         vm = float(getattr(c, "valor_mensal", 0) or 0)
-        mr_name = _first_existing_name(Contrato, ["meses_restantes", "meses_rest", "meses_restante"]) or "meses_restantes"
+        mr_name = _first_existing_name(Contrato, ["meses_restantes","meses_rest","meses_restante","mes_rest"]) or "meses_restantes"
         mr = int(getattr(c, mr_name, 0) or 0)
         return {
             "Ativo": getattr(c, "ativo", None),
@@ -339,54 +335,66 @@ def exportar_contratos(
         headers={"Content-Disposition": 'attachment; filename="contratos.csv"'}
     )
 
-# ------------------ Núcleo comum do batch (timeboxed) ------------------
+# ------------------ Núcleo do batch ------------------
 
-def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_seconds: int, max_batches: int):
+def _run_batch(
+    *,
+    force: bool,
+    dry: bool,
+    debug: bool,
+    start_id: int,
+    max_seconds: int,
+    max_batches: int,
+    processar_retornados: bool = True,       # agora processa retornados por padrão
+):
     t0 = time.monotonic()
 
-    # [NOVO] Detecta virada de mês e auto-force
     st_before = _load_state()
     last_calc_month = st_before.get("last_calc_month")
     now_month = _month_key()
     auto_force_by_month = (last_calc_month != now_month)
 
-    # [MUD] Recalcular SEMPRE por padrão:
-    #   effective_force = True se qualquer condição pedir força.
-    effective_force = bool(force or auto_force_by_month or True)
+    effective_force = True if (force or auto_force_by_month or True) else False
 
     db_read = SessionLocal()
     try:
+        # --- Mapa do cabeçalho: numero_contrato -> (prazo, indice_reajuste, cod_cli, id) ---
         cab_num_name, cab_num_col = _pick_attr(
             ContratoCabecalho, "contrato_n", "contrato_num", "numero", "numero_contrato"
         )
         if cab_num_col is None:
             raise HTTPException(500, detail="ContratoCabecalho sem coluna de número.")
 
-        prazo_name = "prazo_contratual" if hasattr(ContratoCabecalho, "prazo_contratual") else (
-            "periodo_contratual" if hasattr(ContratoCabecalho, "periodo_contratual") else None
-        )
-        indice_name = "indice_reajuste" if hasattr(ContratoCabecalho, "indice_reajuste") else None
+        prazo_name = _first_existing_name(ContratoCabecalho, ["prazo_contratual", "meses_contrato", "tempo_contrato", "prazo"])
+        indice_name = _first_existing_name(ContratoCabecalho, ["indice_reajuste", "indice"])
         codcli_header_exists = hasattr(ContratoCabecalho, "cod_cli")
-        codcli_item_exists = hasattr(Contrato, "cod_cli")
 
-        header_map: dict[str, tuple[int | None, float | None, str | None]] = {}
+        header_by_num: dict[str, tuple[int | None, float | None, str | None, int | None]] = {}
         for cab in db_read.query(ContratoCabecalho).all():
             num = getattr(cab, cab_num_name)
             key = str(num).strip() if num is not None else None
             if not key:
                 continue
-            prazo_raw = getattr(cab, prazo_name, None) if prazo_name else None
-            prazo = _to_int(prazo_raw, 0) if prazo_raw is not None else None
+            raw_prazo = getattr(cab, prazo_name, None) if prazo_name else None
+            prazo = _to_int(raw_prazo, 0) if raw_prazo is not None else None
             indice = getattr(cab, indice_name, None) if indice_name else None
-            codcli = getattr(cab, "cod_cli", None) if codcli_header_exists else None
-            header_map[key] = (prazo, indice, codcli)
+            cab_cod_cli = getattr(cab, "cod_cli", None) if codcli_header_exists else None
+            header_by_num[key] = (prazo, indice, cab_cod_cli, getattr(cab, "id", None))
 
-        mr_aliases = ["meses_restantes", "meses_rest", "meses_restante"]
+        # aliases dos campos nos itens
+        mr_aliases = ["meses_restantes", "meses_rest", "meses_restante", "mes_rest"]
         vg_aliases = ["valor_global_contrato", "valor_global", "valor_global_total", "valor_total"]
         vp_aliases = ["valor_presente_contrato", "valor_presente", "valor_presente_total", "valor_presente_backlog", "backlog", "backlog_total"]
+        periodo_aliases = ["periodo_contratual", "prazo_contratual", "meses_contrato", "tempo_contrato", "prazo", "periodo"]
+
         mr_name = _first_existing_name(Contrato, mr_aliases)
         vg_name = _first_existing_name(Contrato, vg_aliases)
         vp_name = _first_existing_name(Contrato, vp_aliases)
+        periodo_name = _first_existing_name(Contrato, periodo_aliases)
+
+        # campos de identificação
+        item_num_name = _first_existing_name(Contrato, ["contrato_n", "contrato_num", "numero", "numero_contrato"])
+        item_cab_id_name = _first_existing_name(Contrato, ["cabecalho_id", "contrato_cabecalho_id"])
 
         batch_size = 500
         atualizados = 0
@@ -394,6 +402,7 @@ def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_second
         pulados_sem_cab = 0
         pulados_retornado = 0
         copiados_cod_cli = 0
+        preencheu_periodo = 0
         skip_campos = 0
         erros = 0
         err_types: dict[str, int] = {}
@@ -411,13 +420,44 @@ def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_second
             if len(err_samples) < 20:
                 err_samples.append({"id": item_id, "kind": kind, "msg": msg[:300]})
 
+        def _get_prazo_from_header(db_session, item):
+            """
+            Tenta obter prazo (meses) do cabeçalho:
+            1) via cabecalho_id no próprio item;
+            2) via número do contrato -> header_by_num;
+            Retorna int|None.
+            """
+            # 1) via cabecalho_id
+            try:
+                if item_cab_id_name and hasattr(item, item_cab_id_name):
+                    cid = getattr(item, item_cab_id_name, None)
+                    if cid:
+                        cab = db_session.get(ContratoCabecalho, cid)
+                        if cab:
+                            raw = getattr(cab, prazo_name, None) if prazo_name else None
+                            if raw is not None:
+                                return _to_int(raw, 0)
+            except Exception:
+                pass
+            # 2) via número
+            try:
+                if item_num_name and hasattr(item, item_num_name):
+                    numv = getattr(item, item_num_name, None)
+                    key = str(numv).strip() if numv not in (None, "") else None
+                    if key and key in header_by_num:
+                        prazo, _, _, _ = header_by_num[key]
+                        if prazo is not None:
+                            return _to_int(prazo, 0)
+            except Exception:
+                pass
+            return None
+
         def processar_lote(ids: list[int]):
-            nonlocal atualizados, inalterados, pulados_sem_cab, pulados_retornado, copiados_cod_cli, skip_campos
+            nonlocal atualizados, inalterados, pulados_sem_cab, pulados_retornado, copiados_cod_cli, preencheu_periodo, skip_campos
             if not ids:
                 return
             db_write = SessionLocal()
             try:
-                # otimização leve p/ sqlite somente
                 try:
                     if 'sqlite' in str(db_write.bind.engine.url):
                         db_write.execute(text("PRAGMA journal_mode=WAL"))
@@ -425,99 +465,89 @@ def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_second
                     pass
                 itens = db_write.query(Contrato).filter(Contrato.id.in_(ids)).all()
                 for it in itens:
-                    if _is_retornado(it):
+                    if not processar_retornados and _is_retornado(it):
                         pulados_retornado += 1
                         continue
 
-                    item_num_name, _ = _pick_attr(Contrato, "contrato_n", "contrato_num", "numero", "numero_contrato")
-                    if not item_num_name:
-                        pulados_sem_cab += 1
-                        continue
+                    # identificar nº do contrato e tentar metadados do cabeçalho
+                    num_val = getattr(it, item_num_name, None) if item_num_name else None
+                    dados = header_by_num.get(str(num_val).strip()) if (num_val not in (None, "") and header_by_num) else None
+                    cab_prazo = dados[0] if dados else None
+                    indice_anual = dados[1] if dados else None
+                    cab_cod_cli = dados[2] if dados else None
 
-                    num_val = getattr(it, item_num_name)
-                    dados = header_map.get(str(num_val).strip() if num_val is not None else "")
-                    if not dados:
-                        pulados_sem_cab += 1
-                        continue
+                    # 1) Hidratar periodo_contratual se vazio/zero
+                    #    Busca primeiro via cabecalho_id, depois via numero do contrato
+                    periodo_attr_name = periodo_name or _first_existing_name_instance(it, ["periodo_contratual","prazo_contratual","meses_contrato","tempo_contrato","prazo","periodo"])
+                    periodo_val_raw = getattr(it, periodo_attr_name, None) if periodo_attr_name else None
+                    periodo_item = _to_int(periodo_val_raw, 0) if periodo_attr_name else 0
 
-                    prazo, indice_anual, cab_cod_cli = dados
-
-                    try:
-                        if not dry:
-                            ctx_mgr = db_write.begin_nested()
-                        else:
-                            class _Dummy:
-                                def __enter__(self,*a,**k): return self
-                                def __exit__(self,*a,**k): return False
-                            ctx_mgr = _Dummy()
-
-                        with ctx_mgr:
-                            if hasattr(it, "periodo_contratual") and prazo is not None and not dry:
-                                it.periodo_contratual = prazo
-
-                            if codcli_item_exists and cab_cod_cli and getattr(it, "cod_cli", None) != cab_cod_cli and not dry:
-                                it.cod_cli = cab_cod_cli
-                                copiados_cod_cli += 1
-
-                            periodo_raw = getattr(it, "periodo_contratual", None)
-                            periodo = _to_int(periodo_raw if periodo_raw is not None else prazo, 0)
-                            if periodo < 0:
-                                periodo = 0
-
-                            data_inicio = _parse_date_any(
-                                getattr(it, "data_envio", None) or getattr(it, "data_inicio", None) or getattr(it, "data", None)
-                            )
-                            valor_mensal = _to_float(getattr(it, "valor_mensal", 0.0)) or 0.0
-
+                    if (periodo_item is None) or (periodo_item == 0):
+                        prazo_header = _get_prazo_from_header(db_write, it)
+                        if prazo_header is None:
+                            # tenta o mapeamento previamente carregado (header_by_num)
+                            prazo_header = cab_prazo
+                        if prazo_header is not None and periodo_attr_name:
                             try:
-                                mr = calc_meses_restantes(data_inicio, periodo) if data_inicio else 0
+                                setattr(it, periodo_attr_name, int(prazo_header))
+                                preencheu_periodo += 1
+                                periodo_item = int(prazo_header)
                             except Exception:
-                                mr = 0
+                                pass
 
-                            if not any([mr_name, vg_name, vp_name]):
-                                skip_campos += 1
-                            else:
-                                # [MUD] aplica SEMPRE quando effective_force==True
-                                changed = False
-                                if mr_name:
-                                    newv = int(mr or 0)
-                                    if dry:
-                                        prev = getattr(it, mr_name, None); changed = changed or (prev != newv)
-                                    else:
-                                        setattr(it, mr_name, newv)
-                                        changed = True
-                                if vg_name:
-                                    newv = calc_valor_global(valor_mensal, periodo)
-                                    if dry:
-                                        prev = getattr(it, vg_name, None); changed = changed or (prev != newv)
-                                    else:
-                                        setattr(it, vg_name, newv)
-                                        changed = True
-                                if vp_name:
-                                    newv = _safe_valor_presente(valor_mensal, mr, indice_anual)
-                                    if dry:
-                                        prev = getattr(it, vp_name, None); changed = changed or (prev != newv)
-                                    else:
-                                        setattr(it, vp_name, newv)
-                                        changed = True
+                    # 2) Copiar cod_cli do cabeçalho, se existir e fizer sentido
+                    if hasattr(it, "cod_cli") and cab_cod_cli and getattr(it, "cod_cli", None) != cab_cod_cli:
+                        try:
+                            setattr(it, "cod_cli", cab_cod_cli)
+                            copiados_cod_cli += 1
+                        except Exception:
+                            pass
 
-                                if not dry:
-                                    # mesmo que nada pareça "mudar", gravamos para carimbar o recálculo
-                                    if effective_force or changed:
-                                        db_write.flush()
-                                    atualizados += 1  # conta como recalculado
-                                else:
-                                    if changed:
-                                        atualizados += 1
-                                    else:
-                                        inalterados += 1
-                    except Exception as e:
-                        kind = e.__class__.__name__
-                        log_error(kind, str(e), getattr(it, "id", None))
+                    # 3) Calcular derivados SEMPRE
+                    valor_mensal = _to_float(getattr(it, "valor_mensal", 0.0)) or 0.0
+                    data_inicio = _parse_date_any(getattr(it, "data_envio", None) or getattr(it, "data_inicio", None) or getattr(it, "data", None))
+                    try:
+                        mr = calc_meses_restantes(data_inicio, _to_int(periodo_item, 0)) if data_inicio else 0
+                    except Exception:
+                        mr = 0
+
+                    changed = False
+                    if not any([mr_name, vg_name, vp_name]):
+                        skip_campos += 1
+                    else:
+                        if mr_name:
+                            try:
+                                setattr(it, mr_name, int(mr or 0)); changed = True
+                            except Exception:
+                                pass
+                        if vg_name:
+                            try:
+                                vg = calc_valor_global(valor_mensal, _to_int(periodo_item, 0))
+                                setattr(it, vg_name, vg); changed = True
+                            except Exception:
+                                pass
+                        if vp_name:
+                            try:
+                                vp = _safe_valor_presente(valor_mensal, mr, indice_anual)
+                                setattr(it, vp_name, vp); changed = True
+                            except Exception:
+                                pass
+
+                    if not dry:
+                        # grava mesmo se aparentemente "igual" — carimbo de recálculo
+                        db_write.flush()
+                        atualizados += 1
+                    else:
+                        if changed:
+                            atualizados += 1
+                        else:
+                            inalterados += 1
+
                 if not dry:
                     db_write.commit()
             except Exception as e:
-                log_error(e.__class__.__name__, str(e), None)
+                kind = e.__class__.__name__
+                log_error(kind, str(e), None)
                 try:
                     db_write.rollback()
                 except Exception:
@@ -525,8 +555,8 @@ def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_second
             finally:
                 db_write.close()
 
+        # --- loop por páginas de IDs ---
         while True:
-            # [MANTIDO] timebox
             if max_seconds > 0 and (time.monotonic() - t0) >= max_seconds:
                 partial = True
                 break
@@ -553,7 +583,6 @@ def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_second
                 partial = True
                 break
 
-        # [NOVO] Atualiza estado de mês somente se concluído (não parcial)
         if not partial:
             _save_state({
                 "last_calc_month": now_month,
@@ -570,10 +599,11 @@ def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_second
         "ok": 1,
         "updated": atualizados,
         "unchanged": inalterados,
-        "skip_sem_cab": pulados_sem_cab,
+        "skip_sem_cab": pulados_sem_cab,     # mantido para métricas legadas
         "skip_ret": pulados_retornado,
         "skip_campos": skip_campos,
         "copiados_cod_cli": copiados_cod_cli,
+        "preencheu_periodo": preencheu_periodo,  # << novo contador importante
         "errors": erros,
         "err_types": err_types if debug and err_types else None,
         "error_samples": err_samples if debug and err_samples else None,
@@ -583,75 +613,70 @@ def _run_batch(*, force: bool, dry: bool, debug: bool, start_id: int, max_second
         "batches_done": batches_done,
         "elapsed_s": elapsed,
         "limits": {"max_seconds": max_seconds, "max_batches": max_batches, "batch_size": batch_size},
-        # [NOVO] meta de force/mês
         "force_requested": bool(force),
         "auto_force_by_month": bool(auto_force_by_month),
         "last_calc_month_before": last_calc_month,
         "now_month": now_month,
     }
-
-    if erros:
-        log.warning("[contratos_sync][debug] errors=%s types=%s", erros, err_types)
-        if err_samples:
-            log.warning("[contratos_sync][debug] samples=%s", err_samples[:3])
-
     return payload
 
-# ------------------ SINCRONIZAÇÕES ------------------
+# ------------------ Endpoints ------------------
 
 @router.post("/sincronizar")
 def sincronizar_todos(request: Request):
     debug = request.query_params.get("debug") in {"1", "true", "True"}
     as_json = request.query_params.get("json") in {"1", "true", "True"} or request.query_params.get("format") == "json"
-    # [MUD] default agora força recálculo
     force = request.query_params.get("force", "true") in {"1","true","True"}
     start_id = int(request.query_params.get("start_id", 0) or 0)
-    # [MUD] sem limite por padrão: processa até o fim
     max_seconds = int(request.query_params.get("max_seconds", 0) or 0)
     max_batches = int(request.query_params.get("max_batches", 0) or 0)
+    processar_ret = request.query_params.get("processar_retornados", "true") in {"1","true","True"}
 
     payload = _run_batch(
         force=force, dry=False, debug=debug,
         start_id=start_id, max_seconds=max_seconds, max_batches=max_batches,
+        processar_retornados=processar_ret,
     )
     if as_json:
         return JSONResponse(payload)
 
     url = request.headers.get("referer") or "/contratos"
     qp = (
-        f"?ok=1&n={payload['updated']}&inalterados={payload['unchanged']}&skip_sem_cab={payload['skip_sem_cab']}"
-        f"&skip_ret={payload['skip_ret']}&codcli={payload['copiados_cod_cli']}&skip_campos={payload['skip_campos']}&err={payload['errors']}"
+        f"?ok=1&n={payload['updated']}&inalterados={payload['unchanged']}"
+        f"&preencheu_periodo={payload['preencheu_periodo']}"
+        f"&skip_ret={payload['skip_ret']}&codcli={payload['copiados_cod_cli']}"
+        f"&skip_campos={payload['skip_campos']}&err={payload['errors']}"
         f"&partial={'1' if payload.get('partial') else '0'}"
         f"&auto_force={'1' if payload.get('auto_force_by_month') else '0'}"
     )
     return RedirectResponse(url + qp, status_code=303)
 
-# GET que executa o batch e retorna JSON (sem POST / sem DevTools)
 @router.get("/sincronizar_debug")
 def sincronizar_debug(
-    # [MUD] padrão com force=True
     force: bool = Query(default=True),
     start_id: int = Query(default=0, ge=0),
-    # [MUD] sem limites por padrão (0 = desativado)
     max_seconds: int = Query(default=0, ge=0),
     max_batches: int = Query(default=0, ge=0),
+    processar_retornados: bool = Query(default=True),
 ):
     payload = _run_batch(
         force=bool(force), dry=False, debug=True,
         start_id=int(start_id or 0), max_seconds=int(max_seconds or 0), max_batches=int(max_batches or 0),
+        processar_retornados=bool(processar_retornados),
     )
     return JSONResponse(payload)
 
-# GET de DRY-RUN (não escreve nada) — mostra o que seria alterado
 @router.get("/sincronizar_dry")
 def sincronizar_dry(
-    force: bool = Query(default=True),     # [MUD] default True
+    force: bool = Query(default=True),
     start_id: int = Query(default=0, ge=0),
     max_seconds: int = Query(default=0, ge=0),
     max_batches: int = Query(default=0, ge=0),
+    processar_retornados: bool = Query(default=True),
 ):
     payload = _run_batch(
         force=bool(force), dry=True, debug=True,
         start_id=int(start_id or 0), max_seconds=int(max_seconds or 0), max_batches=int(max_batches or 0),
+        processar_retornados=bool(processar_retornados),
     )
     return JSONResponse(payload)
