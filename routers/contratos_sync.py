@@ -1,11 +1,22 @@
 # =============================================================================
 # routers/contratos_sync.py
-# Versão: v2.7.0 (2025-09-02)
+# Versão: v2.8.0 (2025-09-02)
 #
-# Novidades x v2.6.1:
-# - [FIX CRÍTICO] Hidrata periodo_contratual do item a partir do ContratoCabecalho
-#   quando o campo do item está vazio/zero, ANTES dos cálculos.
-# - [KEEP] Recalcula sempre; auto-force por virada de mês; estrutura original.
+# O QUE MUDA NESTA VERSÃO (em relação à v2.7.0):
+# - [CRÍTICO] PROCESSO EM 2 FASES:
+#   Fase 1) Atualiza/Preenche 'periodo_contratual' (ou alias) em TODOS os itens.
+#           Se algum item continuar sem período (0/None), a rotina PARA e retorna
+#           a lista de pendentes para ajuste manual (sem rodar fórmulas).
+#   Fase 2) Somente se a Fase 1 não tiver pendências, recalcula os 3 campos:
+#           - meses_restantes (aliases suportados)
+#           - valor_global_contrato (aliases)
+#           - valor_presente_contrato (aliases)
+#
+# - [MANTIDO] Auto-force por virada de mês, rotas, exportação, diagnósticos,
+#   paginação por ID, e compatibilidade com SQLite/Postgres.
+#
+# Observação: Usamos 'periodo_contratual' como nome "canônico" no item, mas
+#             aceitamos aliases tanto no item quanto no cabeçalho.
 # =============================================================================
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
@@ -29,7 +40,7 @@ from io import StringIO, BytesIO
 from datetime import datetime, date
 import json, os, logging, re, time
 
-VERSION = "v2.7.0"
+VERSION = "v2.8.0"
 log = logging.getLogger("uvicorn.error")
 log.info("[contratos_sync] carregado %s", VERSION)
 
@@ -235,8 +246,6 @@ def contratos_view(
         "incluir_retornados": incluir_retornados,
         "valor_mensal_sum": valor_mensal_sum,
         "backlog_sum": backlog_sum,
-        "valor_mensal_total": valor_mensal_sum,
-        "backlog_total": backlog_sum,
     }
     return _template_response(ctx)
 
@@ -335,7 +344,7 @@ def exportar_contratos(
         headers={"Content-Disposition": 'attachment; filename="contratos.csv"'}
     )
 
-# ------------------ Núcleo do batch ------------------
+# ------------------ Núcleo do batch (duas fases) ------------------
 
 def _run_batch(
     *,
@@ -345,8 +354,14 @@ def _run_batch(
     start_id: int,
     max_seconds: int,
     max_batches: int,
-    processar_retornados: bool = True,       # agora processa retornados por padrão
+    processar_retornados: bool = True,
 ):
+    """
+    Agora o processo tem DUAS FASES:
+      Fase 1) Preencher periodo_contratual em TODOS os itens (via cabeçalho).
+              Se sobrar qualquer item sem período => PARA e informa pendências.
+      Fase 2) Se Fase 1 OK, recalcula os 3 campos derivados em TODOS os itens.
+    """
     t0 = time.monotonic()
 
     st_before = _load_state()
@@ -358,7 +373,7 @@ def _run_batch(
 
     db_read = SessionLocal()
     try:
-        # --- Mapa do cabeçalho: numero_contrato -> (prazo, indice_reajuste, cod_cli, id) ---
+        # --- Cabeçalho mapeado por número ---
         cab_num_name, cab_num_col = _pick_attr(
             ContratoCabecalho, "contrato_n", "contrato_num", "numero", "numero_contrato"
         )
@@ -381,7 +396,7 @@ def _run_batch(
             cab_cod_cli = getattr(cab, "cod_cli", None) if codcli_header_exists else None
             header_by_num[key] = (prazo, indice, cab_cod_cli, getattr(cab, "id", None))
 
-        # aliases dos campos nos itens
+        # ALIASES
         mr_aliases = ["meses_restantes", "meses_rest", "meses_restante", "mes_rest"]
         vg_aliases = ["valor_global_contrato", "valor_global", "valor_global_total", "valor_total"]
         vp_aliases = ["valor_presente_contrato", "valor_presente", "valor_presente_total", "valor_presente_backlog", "backlog", "backlog_total"]
@@ -392,14 +407,13 @@ def _run_batch(
         vp_name = _first_existing_name(Contrato, vp_aliases)
         periodo_name = _first_existing_name(Contrato, periodo_aliases)
 
-        # campos de identificação
         item_num_name = _first_existing_name(Contrato, ["contrato_n", "contrato_num", "numero", "numero_contrato"])
         item_cab_id_name = _first_existing_name(Contrato, ["cabecalho_id", "contrato_cabecalho_id"])
 
         batch_size = 500
+        # métricas
         atualizados = 0
         inalterados = 0
-        pulados_sem_cab = 0
         pulados_retornado = 0
         copiados_cod_cli = 0
         preencheu_periodo = 0
@@ -407,6 +421,8 @@ def _run_batch(
         erros = 0
         err_types: dict[str, int] = {}
         err_samples = []
+        pendencias_periodo = 0
+        pendencias_lista = []  # amostras
 
         last_id = int(max(0, start_id or 0))
         batches_done = 0
@@ -421,12 +437,6 @@ def _run_batch(
                 err_samples.append({"id": item_id, "kind": kind, "msg": msg[:300]})
 
         def _get_prazo_from_header(db_session, item):
-            """
-            Tenta obter prazo (meses) do cabeçalho:
-            1) via cabecalho_id no próprio item;
-            2) via número do contrato -> header_by_num;
-            Retorna int|None.
-            """
             # 1) via cabecalho_id
             try:
                 if item_cab_id_name and hasattr(item, item_cab_id_name):
@@ -452,40 +462,37 @@ def _run_batch(
                 pass
             return None
 
-        def processar_lote(ids: list[int]):
-            nonlocal atualizados, inalterados, pulados_sem_cab, pulados_retornado, copiados_cod_cli, preencheu_periodo, skip_campos
+        # ---------------- FASE 1: preencher periodo em TODOS os itens ----------------
+        def preencher_periodos(ids: list[int]):
+            nonlocal preencheu_periodo, pendencias_periodo, copiados_cod_cli
             if not ids:
                 return
-            db_write = SessionLocal()
+            dbw = SessionLocal()
             try:
                 try:
-                    if 'sqlite' in str(db_write.bind.engine.url):
-                        db_write.execute(text("PRAGMA journal_mode=WAL"))
+                    if 'sqlite' in str(dbw.bind.engine.url):
+                        dbw.execute(text("PRAGMA journal_mode=WAL"))
                 except Exception:
                     pass
-                itens = db_write.query(Contrato).filter(Contrato.id.in_(ids)).all()
+                itens = dbw.query(Contrato).filter(Contrato.id.in_(ids)).all()
                 for it in itens:
                     if not processar_retornados and _is_retornado(it):
-                        pulados_retornado += 1
+                        # Mesmo na fase 1, se o usuário optar por não processar retornados, pulamos.
                         continue
 
-                    # identificar nº do contrato e tentar metadados do cabeçalho
                     num_val = getattr(it, item_num_name, None) if item_num_name else None
                     dados = header_by_num.get(str(num_val).strip()) if (num_val not in (None, "") and header_by_num) else None
                     cab_prazo = dados[0] if dados else None
-                    indice_anual = dados[1] if dados else None
                     cab_cod_cli = dados[2] if dados else None
 
-                    # 1) Hidratar periodo_contratual se vazio/zero
-                    #    Busca primeiro via cabecalho_id, depois via numero do contrato
-                    periodo_attr_name = periodo_name or _first_existing_name_instance(it, ["periodo_contratual","prazo_contratual","meses_contrato","tempo_contrato","prazo","periodo"])
+                    periodo_attr_name = periodo_name or _first_existing_name_instance(it, periodo_aliases)
                     periodo_val_raw = getattr(it, periodo_attr_name, None) if periodo_attr_name else None
                     periodo_item = _to_int(periodo_val_raw, 0) if periodo_attr_name else 0
 
+                    # se vazio/0, tenta puxar do cabeçalho
                     if (periodo_item is None) or (periodo_item == 0):
-                        prazo_header = _get_prazo_from_header(db_write, it)
+                        prazo_header = _get_prazo_from_header(dbw, it)
                         if prazo_header is None:
-                            # tenta o mapeamento previamente carregado (header_by_num)
                             prazo_header = cab_prazo
                         if prazo_header is not None and periodo_attr_name:
                             try:
@@ -495,7 +502,17 @@ def _run_batch(
                             except Exception:
                                 pass
 
-                    # 2) Copiar cod_cli do cabeçalho, se existir e fizer sentido
+                    # se ainda ficou inválido => registrar pendência
+                    if (periodo_item is None) or (periodo_item == 0):
+                        pendencias_periodo += 1
+                        if len(pendencias_lista) < 100:
+                            pendencias_lista.append({
+                                "item_id": getattr(it, "id", None),
+                                "contrato_num": str(num_val) if num_val not in (None, "") else None,
+                                "motivo": "Periodo não encontrado em cabeçalho (cabecalho_id/numero).",
+                            })
+
+                    # manter cod_cli alinhado ao cabeçalho (opcional, ajuda nos relatórios)
                     if hasattr(it, "cod_cli") and cab_cod_cli and getattr(it, "cod_cli", None) != cab_cod_cli:
                         try:
                             setattr(it, "cod_cli", cab_cod_cli)
@@ -503,9 +520,47 @@ def _run_batch(
                         except Exception:
                             pass
 
-                    # 3) Calcular derivados SEMPRE
+                if not dry:
+                    dbw.commit()
+            except Exception as e:
+                log_error(e.__class__.__name__, str(e), None)
+                try:
+                    dbw.rollback()
+                except Exception:
+                    pass
+            finally:
+                dbw.close()
+
+        # ---------------- FASE 2: calcular campos derivados para TODOS ----------------
+        def calcular_derivados(ids: list[int]):
+            nonlocal atualizados, inalterados, skip_campos
+            if not ids:
+                return
+            dbw = SessionLocal()
+            try:
+                try:
+                    if 'sqlite' in str(dbw.bind.engine.url):
+                        dbw.execute(text("PRAGMA journal_mode=WAL"))
+                except Exception:
+                    pass
+                itens = dbw.query(Contrato).filter(Contrato.id.in_(ids)).all()
+                for it in itens:
+                    if not processar_retornados and _is_retornado(it):
+                        continue
+
+                    # período agora DEVE existir (fase 1 garantiu)
+                    periodo_attr_name = periodo_name or _first_existing_name_instance(it, periodo_aliases)
+                    periodo_val_raw = getattr(it, periodo_attr_name, None) if periodo_attr_name else None
+                    periodo_item = _to_int(periodo_val_raw, 0) if periodo_attr_name else 0
+
+                    # metadados do cabeçalho (índice usado no valor-presente)
+                    num_val = getattr(it, item_num_name, None) if item_num_name else None
+                    dados = header_by_num.get(str(num_val).strip()) if (num_val not in (None, "") and header_by_num) else None
+                    indice_anual = dados[1] if dados else None
+
                     valor_mensal = _to_float(getattr(it, "valor_mensal", 0.0)) or 0.0
                     data_inicio = _parse_date_any(getattr(it, "data_envio", None) or getattr(it, "data_inicio", None) or getattr(it, "data", None))
+
                     try:
                         mr = calc_meses_restantes(data_inicio, _to_int(periodo_item, 0)) if data_inicio else 0
                     except Exception:
@@ -518,24 +573,20 @@ def _run_batch(
                         if mr_name:
                             try:
                                 setattr(it, mr_name, int(mr or 0)); changed = True
-                            except Exception:
-                                pass
+                            except Exception: pass
                         if vg_name:
                             try:
                                 vg = calc_valor_global(valor_mensal, _to_int(periodo_item, 0))
                                 setattr(it, vg_name, vg); changed = True
-                            except Exception:
-                                pass
+                            except Exception: pass
                         if vp_name:
                             try:
                                 vp = _safe_valor_presente(valor_mensal, mr, indice_anual)
                                 setattr(it, vp_name, vp); changed = True
-                            except Exception:
-                                pass
+                            except Exception: pass
 
                     if not dry:
-                        # grava mesmo se aparentemente "igual" — carimbo de recálculo
-                        db_write.flush()
+                        dbw.flush()
                         atualizados += 1
                     else:
                         if changed:
@@ -544,25 +595,23 @@ def _run_batch(
                             inalterados += 1
 
                 if not dry:
-                    db_write.commit()
+                    dbw.commit()
             except Exception as e:
-                kind = e.__class__.__name__
-                log_error(kind, str(e), None)
+                log_error(e.__class__.__name__, str(e), None)
                 try:
-                    db_write.rollback()
+                    dbw.rollback()
                 except Exception:
                     pass
             finally:
-                db_write.close()
+                dbw.close()
 
-        # --- loop por páginas de IDs ---
+        # ---------------- LOOP PAGINADO: FASE 1 ----------------
+        last_id = int(max(0, start_id or 0))
         while True:
             if max_seconds > 0 and (time.monotonic() - t0) >= max_seconds:
-                partial = True
-                break
+                partial = True; break
             if max_batches > 0 and batches_done >= max_batches:
-                partial = True
-                break
+                partial = True; break
 
             id_rows = (
                 db_read.query(Contrato.id)
@@ -575,14 +624,69 @@ def _run_batch(
             if not ids:
                 break
             prev_last_id = last_id
-            processar_lote(ids)
+            preencher_periodos(ids)
             last_id = ids[-1]
             batches_done += 1
             if last_id == prev_last_id:
-                cursor_stall = True
-                partial = True
-                break
+                cursor_stall = True; partial = True; break
 
+        # Se houve pendências na Fase 1, PARA e informa
+        if pendencias_periodo > 0:
+            elapsed = round(time.monotonic() - t0, 3)
+            return {
+                "version": VERSION,
+                "ok": 0,
+                "fase": "periodo",
+                "stop_reason": "periodo_invalido",
+                "faltando_periodo": pendencias_periodo,
+                "faltando_amostras": pendencias_lista,
+                "preencheu_periodo": preencheu_periodo,
+                "copiados_cod_cli": copiados_cod_cli,
+                "errors": erros,
+                "err_types": err_types if debug and err_types else None,
+                "error_samples": err_samples if debug and err_samples else None,
+                "partial": partial,
+                "cursor_stall": cursor_stall,
+                "batches_done": batches_done,
+                "elapsed_s": elapsed,
+                "limits": {"max_seconds": max_seconds, "max_batches": max_batches, "batch_size": batch_size},
+            }
+
+        # ---------------- LOOP PAGINADO: FASE 2 ----------------
+        # reinicia varredura desde o início
+        last_id = int(max(0, start_id or 0))
+        # zera contadores que são da fase 2
+        atualizados = 0
+        inalterados = 0
+        skip_campos = 0
+        batches_done = 0
+        partial = False
+        cursor_stall = False
+
+        while True:
+            if max_seconds > 0 and (time.monotonic() - t0) >= max_seconds:
+                partial = True; break
+            if max_batches > 0 and batches_done >= max_batches:
+                partial = True; break
+
+            id_rows = (
+                db_read.query(Contrato.id)
+                .filter(Contrato.id > last_id)
+                .order_by(Contrato.id)
+                .limit(batch_size)
+                .all()
+            )
+            ids = [int(r[0] if isinstance(r, (list, tuple)) else getattr(r, "id", r)) for r in id_rows]
+            if not ids:
+                break
+            prev_last_id = last_id
+            calcular_derivados(ids)
+            last_id = ids[-1]
+            batches_done += 1
+            if last_id == prev_last_id:
+                cursor_stall = True; partial = True; break
+
+        # fim OK -> atualiza estado de mês
         if not partial:
             _save_state({
                 "last_calc_month": now_month,
@@ -597,13 +701,12 @@ def _run_batch(
     payload = {
         "version": VERSION,
         "ok": 1,
+        "fase": "calculos",
         "updated": atualizados,
         "unchanged": inalterados,
-        "skip_sem_cab": pulados_sem_cab,     # mantido para métricas legadas
-        "skip_ret": pulados_retornado,
         "skip_campos": skip_campos,
         "copiados_cod_cli": copiados_cod_cli,
-        "preencheu_periodo": preencheu_periodo,  # << novo contador importante
+        "preencheu_periodo": preencheu_periodo,  # do ciclo completo
         "errors": erros,
         "err_types": err_types if debug and err_types else None,
         "error_samples": err_samples if debug and err_samples else None,
@@ -640,15 +743,19 @@ def sincronizar_todos(request: Request):
     if as_json:
         return JSONResponse(payload)
 
+    # Query params resumidos para UI
+    if payload.get("fase") == "periodo" and payload.get("faltando_periodo", 0) > 0:
+        # inclui indicador de pendências
+        qp = f"?ok=0&faltando={payload['faltando_periodo']}&preencheu={payload.get('preencheu_periodo',0)}"
+    else:
+        qp = (
+            f"?ok=1&n={payload.get('updated',0)}&inalterados={payload.get('unchanged',0)}"
+            f"&preencheu_periodo={payload.get('preencheu_periodo',0)}"
+            f"&skip_campos={payload.get('skip_campos',0)}&err={payload.get('errors',0)}"
+            f"&partial={'1' if payload.get('partial') else '0'}"
+        )
+
     url = request.headers.get("referer") or "/contratos"
-    qp = (
-        f"?ok=1&n={payload['updated']}&inalterados={payload['unchanged']}"
-        f"&preencheu_periodo={payload['preencheu_periodo']}"
-        f"&skip_ret={payload['skip_ret']}&codcli={payload['copiados_cod_cli']}"
-        f"&skip_campos={payload['skip_campos']}&err={payload['errors']}"
-        f"&partial={'1' if payload.get('partial') else '0'}"
-        f"&auto_force={'1' if payload.get('auto_force_by_month') else '0'}"
-    )
     return RedirectResponse(url + qp, status_code=303)
 
 @router.get("/sincronizar_debug")
